@@ -43,7 +43,15 @@ class LensModel(object):
                                                self.calibration['radial_params'],
                                                self.calibration['tangential_params'])
 
+    def image_distance_to_calibrated(self, distance):
+        """Compute a distance in the calibrated domain equivalent to the specified
+        distance in the image domain. This is an approximation and only applies near
+        the center of the image."""
+        return np.mean(np.diag(self.camera_matrix_inv)[:2] * distance)
 
+
+# Taken from:
+# https://github.com/FlybyMedia/Nestor/blob/master/data/camera/iPhone5640h360wparameters_Oleg.xml
 IPHONE_5S_CALIBRATION = dict(
     image_size=(1280,720),
     camera_matrix=np.array([[625.39885, 0, 321.32716],
@@ -51,9 +59,9 @@ IPHONE_5S_CALIBRATION = dict(
                             [0., 0., 1.]]),
     radial_params=[0.08238, -0.03432, 0.],
     tangential_params=[0., 0.],
-    camera_to_imu_rotation=np.array([[-0.00046152, -0.99999178, -0.00402814],
-                                     [-0.99997218, 0.00043151, 0.00744678],
-                                     [-0.00744498, 0.00403146, -0.99996416]])
+    camera_to_imu_rotation=np.array([[-0.99731099, -0.0675295, -0.02847041],
+                                     [0.06712113, -0.9976311, 0.01506464],
+                                     [-0.02942027, 0.01311316, 0.99948111]])
 )
 
 

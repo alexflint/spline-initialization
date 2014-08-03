@@ -170,7 +170,7 @@ class SO3(LieGroup):
             v[a] = s/2.
             v[b] = (R[b,a] + R[a,b]) / (2.*s)
             v[c] = (R[c,a] + R[a,c]) / (2.*s)
-            return v / np.norm(v)
+            return v / np.linalg.norm(v)
 
     # Compute jacobian of exp(m)*x with respect to m, evaluated at
     # m=[0,0,0]. x is assumed constant with respect to m.
