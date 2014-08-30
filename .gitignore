@@ -39,3 +39,5 @@ MANIFEST
 
 # PyCharm
 .idea
+problem_dumps
+out
