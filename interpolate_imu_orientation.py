@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 
 from lie import SO3
 
+
 def main():
     orientation_data = np.loadtxt('out/frame_orientations.txt')
     accel_data = np.loadtxt('out/accelerometer.txt')

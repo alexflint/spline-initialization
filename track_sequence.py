@@ -64,6 +64,11 @@ def main():
     frame_timestamps = [all_frame_timestamps[i] for i in frame_indices]
     frame_orientations = [np.eye(3)]
 
+    begin_time = frame_timestamps[0]
+    end_time = frame_timestamps[-1]
+    print 'Begin time:', begin_time
+    print 'End time:', end_time
+
     # Create descriptor
     orb = cv2.ORB()
 
@@ -125,11 +130,21 @@ def main():
             else:
                 outlier_matches.append(match)
 
-        plt.clf()
-        plt.hold('on')
-        plot_correspondences(gray_images[0], gray_images[i], keypoints[0], keypoints[i], outlier_matches, 'r-')
-        plot_correspondences(gray_images[0], gray_images[i], keypoints[0], keypoints[i], inlier_matches, 'b-')
-        plt.show()
+        #plt.clf()
+        #plt.hold('on')
+        #plot_correspondences(gray_images[0],
+        #                     gray_images[i],
+        #                     keypoints[0],
+        #                     keypoints[i],
+        #                     outlier_matches,
+        #                     'r-')
+        #plot_correspondences(gray_images[0],
+        #                     gray_images[i],
+        #                     keypoints[0],
+        #                     keypoints[i],
+        #                     inlier_matches,
+        #                     'b-')
+        #plt.show()
 
 
     def compute_correspondence_matrix(tracks, num_frames):
@@ -156,11 +171,14 @@ def main():
                           np.asarray(frame_orientations).reshape((-1, 9)))))
 
     accel_data = np.loadtxt(str(data_dir / 'accelerometer.txt'))
-    begin_time = frame_timestamps[0]
-    end_time = frame_timestamps[-1]
-    accel_mask = np.logical_and(begin_time < accel_data[:,0], accel_data[:,0] < end_time)
-    accel = accel_data[accel_mask]
-    np.savetxt('out/accelerometer.txt', accel)
+    accel_data_out = []
+    for row in accel_data:
+        timestamp = row[0]
+        if begin_time < timestamp < end_time:
+            cam_reading = np.dot(calibration.IPHONE_5S_CALIBRATION['camera_to_imu_rotation'].T, row[1:])
+            accel_data_out.append(np.hstack((row[0], cam_reading)))
+
+    np.savetxt('out/accelerometer.txt', accel_data_out)
 
     with open('out/features.txt', 'w') as fd:
         for i, track in enumerate(inlier_tracks):

@@ -5,9 +5,9 @@ def skew(m):
     # Compute the skew-symmetric matrix for m
     m = np.asarray(m)
     assert m.shape == (3,), 'shape was was %s' % str(m.shape)
-    return np.array([[  0,    -m[2],  m[1] ],
-                     [  m[2],  0,    -m[0] ],
-                     [ -m[1],  m[0],  0.   ]])
+    return np.array([[ 0,    -m[2],  m[1]],
+                     [ m[2],  0,    -m[0]],
+                     [-m[1],  m[0],  0.  ]])
 
 
 class LieGroup(object):
