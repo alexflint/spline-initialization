@@ -30,8 +30,8 @@ def essential_matrix(R, t):
 
 
 def pr(x):
-    x = np.atleast_2d(x)
-    return x[:,:-1] / x[:,-1:]
+    x = np.asarray(x)
+    return x[..., :-1] / x[..., -1:]
 
 
 def unpr(x):

@@ -3,8 +3,9 @@ import scipy.optimize
 import numdifftools
 
 from bezier import bezier, zero_offset_bezier, zero_offset_bezier_deriv
-from utils import skew, cayley, angular_velocity_from_cayley_deriv
+from utils import cayley, angular_velocity_from_cayley_deriv, add_white_noise, add_orientation_noise, cayley_inv
 from lie import SO3
+from fit_bezier import fit_zero_offset_bezier
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -44,15 +45,6 @@ def orientation_residuals(bezier_params, observed_timestamps, observed_orientati
                       for t, r in zip(observed_timestamps, observed_orientations)])
 
 
-def add_white_noise(x, sigma):
-    return x + np.random.randn(*x.shape) * sigma
-
-
-def add_orientation_noise(x, sigma):
-    x = np.atleast_3d(x)
-    return np.array([np.dot(xi, SO3.exp(np.random.randn(3)*sigma)) for xi in x])
-
-
 def run_furgale():
     bezier_order = 4
 
@@ -75,6 +67,50 @@ def run_furgale():
 
     print 'Numeric left:', angular_velocity_left(lambda t: cayley(bez(t)), t0)
     print 'Analytic local:', np.dot(r0, w0)
+
+
+def fit_orientation_bezier(bezier_order, timestamps, orientations):
+    cayleys = np.array(map(cayley_inv, orientations))
+    return fit_zero_offset_bezier(timestamps, cayleys, bezier_order)
+
+
+def estimate_orientation(bezier_order,
+                         observed_gyro_timestamps,
+                         observed_gyro_readings,
+                         observed_frame_timestamps,
+                         observed_frame_orientations,
+                         tol=1e-4,
+                         **kwargs):
+    #seed_params = np.zeros((bezier_order, 3))
+    seed_params = fit_orientation_bezier(bezier_order, observed_frame_timestamps, observed_frame_orientations)
+
+    seed_gyro_bias = np.zeros(3)
+    seed = np.hstack((seed_gyro_bias, seed_params.flatten()))
+
+    def residuals(x):
+        gyro_bias = x[:3]
+        bezier_params = x[3:].reshape((bezier_order, 3))
+        r_gyro = gyro_residuals(bezier_params, gyro_bias, observed_gyro_timestamps, observed_gyro_readings)
+        r_orient = orientation_residuals(bezier_params, observed_frame_timestamps, observed_frame_orientations)
+        return np.hstack((r_gyro, r_orient))
+
+    def cost(x):
+        r = residuals(x)
+        return np.dot(r, r)
+
+    kwargs.setdefault('maxiter', 1500)
+    out = scipy.optimize.minimize(cost, seed, tol=tol, options=kwargs)
+    estimated_gyro_bias = out.x[:3]
+    estimated_params = out.x[3:].reshape((bezier_order, 3))
+
+    #print '\nSeed:'
+    #print seed_params
+    #print '\nEstimate:'
+    #print estimated_params
+    #print '\nOrientation estimation: nfev=%f\n\n' % out.nfev
+    #exit(0)
+
+    return estimated_gyro_bias, estimated_params
 
 
 def run_optimize():
@@ -106,30 +142,11 @@ def run_optimize():
     observed_frame_timestamps = add_white_noise(true_frame_timestamps, frame_timestamp_noise)
     observed_frame_orientations = add_orientation_noise(true_frame_orientations, frame_orientation_noise)
 
-    seed_params = np.zeros((bezier_order, 3))
-    seed_gyro_bias = np.zeros(3)
-    seed = np.hstack((seed_gyro_bias, seed_params.flatten()))
-
-    def residuals(x):
-        gyro_bias = x[:3]
-        bezier_params = x[3:].reshape((bezier_order, 3))
-        r_gyro = gyro_residuals(bezier_params, gyro_bias, observed_gyro_timestamps, observed_gyro_readings)
-        r_orient = orientation_residuals(bezier_params, observed_frame_timestamps, observed_frame_orientations)
-        return np.hstack((r_gyro, r_orient))
-
-    def cost(x):
-        r = residuals(x)
-        return np.dot(r, r)
-
-    print 'Optimizing...'
-    out = scipy.optimize.minimize(cost,
-                                  seed,
-                                  tol=1e-8,
-                                  options=dict(maxiter=500))
-
-    estimate = out.x
-    estimated_gyro_bias = estimate[:3]
-    estimated_params = estimate[3:].reshape((bezier_order, 3))
+    estimated_gyro_bias, estimated_params = estimate_orientation(bezier_order,
+                                                                 observed_gyro_timestamps,
+                                                                 observed_gyro_readings,
+                                                                 observed_frame_timestamps,
+                                                                 observed_frame_orientations)
 
     print '\nTrue params:'
     print true_params
@@ -142,9 +159,6 @@ def run_optimize():
 
     print '\nEstimated gyro bias:'
     print estimated_gyro_bias
-
-    print '\nCost at seed:', cost(seed)
-    print 'Cost at estimate:', cost(estimate)
 
     plot_timestamps = np.linspace(0, 1, 50)
 

@@ -1,6 +1,10 @@
 import numpy as np
 
 
+def repeat_diag(x, k):
+    return np.hstack([np.eye(k, dtype=x.dtype) * xi for xi in x])
+
+
 def bezier(params, t):
     """Evaluate a bezier curve at time t (between 0 and 1)"""
     return np.dot(bezier_coefs(t, len(params)-1), params)
@@ -39,10 +43,6 @@ def bezier_second_deriv_coefs(t, order):
         dc = bezier_deriv_coefs(t, order-1)
         ddc = bezier_second_deriv_coefs(t, order-1)
         return np.hstack((ddc, 0))*(1.-t) + np.hstack((0, ddc))*t - np.hstack((dc, 0))*2 + np.hstack((0, dc))*2
-
-
-def repeat_diag(x, k):
-    return np.hstack([np.eye(k, dtype=x.dtype) * xi for xi in x])
 
 
 def zero_offset_bezier(params, t):
