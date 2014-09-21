@@ -6,8 +6,9 @@ from mpl_toolkits.mplot3d.axes3d import Axes3D
 
 from lie import SO3
 from geometry import pr
-from utils import cayley, normalized, add_white_noise, add_orientation_noise
+from utils import normalized, add_white_noise, add_orientation_noise
 from bezier import zero_offset_bezier
+from cayley import cayley
 
 from estimate_orientation import estimate_orientation, predict_gyro, predict_orientation
 from estimate_position import estimate_position, predict_accel, predict_feature

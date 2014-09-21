@@ -8,7 +8,8 @@ from mpl_toolkits.mplot3d.axes3d import Axes3D
 
 from lie import SO3
 from geometry import pr
-from utils import cayley, normalized, skew_jacobian, essential_matrix, add_white_noise, add_orientation_noise
+from cayley import cayley
+from utils import normalized, skew_jacobian, essential_matrix, add_white_noise, add_orientation_noise
 from bezier import zero_offset_bezier, zero_offset_bezier_mat, zero_offset_bezier_second_deriv, zero_offset_bezier_second_deriv_mat
 
 

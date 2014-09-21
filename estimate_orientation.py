@@ -3,7 +3,8 @@ import scipy.optimize
 import numdifftools
 
 from bezier import bezier, zero_offset_bezier, zero_offset_bezier_deriv
-from utils import cayley, angular_velocity_from_cayley_deriv, add_white_noise, add_orientation_noise, cayley_inv
+from cayley import cayley, angular_velocity_from_cayley_deriv, cayley_inv
+from utils import add_white_noise, add_orientation_noise
 from lie import SO3
 from fit_bezier import fit_zero_offset_bezier
 
