@@ -1,6 +1,5 @@
 import numpy as np
 import scipy.optimize
-import cv2
 
 from lie import SO3
 
@@ -39,6 +38,11 @@ def unpr(x):
         return np.hstack((x, 1))
     else:
         return np.hstack((x, np.ones((np.shape(x)[0], 1))))
+
+
+def arctans(ps):
+    ps = np.asarray(ps)
+    return np.arctan2(ps[..., :-1], ps[..., -1:])
 
 
 def pose_from_essential_matrix(E):

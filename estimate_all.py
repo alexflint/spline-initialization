@@ -5,10 +5,11 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.axes3d import Axes3D
 
 from lie import SO3
-from geometry import pr
+from geometry import pr, arctans
 from utils import normalized, add_white_noise, add_orientation_noise
 from bezier import zero_offset_bezier
 from cayley import cayley
+from plotting import plot_tracks
 
 from estimate_orientation import estimate_orientation, predict_gyro, predict_orientation
 from estimate_position import estimate_position, predict_accel, predict_feature
@@ -56,7 +57,8 @@ def run_position_estimation():
     true_rot_controls = np.random.randn(bezier_degree-1, 3)
     true_pos_controls = np.random.randn(bezier_degree-1, 3)
 
-    true_landmarks = np.random.randn(num_landmarks, 3) * 20
+    true_landmarks = np.random.randn(num_landmarks, 3) * 5
+    true_landmarks[:, 2] += 20
 
     true_frame_orientations = np.array([cayley(zero_offset_bezier(true_rot_controls, t)) for t in true_frame_timestamps])
     true_frame_positions = np.array([zero_offset_bezier(true_pos_controls, t) for t in true_frame_timestamps])
@@ -88,6 +90,15 @@ def run_position_estimation():
     observed_features = add_white_noise(true_features, feature_noise)
 
     #
+    # Plot features
+    #
+    plt.clf()
+    plot_tracks(true_features, 'x-g', limit=10, alpha=.4)
+    plot_tracks(observed_features, 'o-r', limit=10, alpha=.4)
+    plt.show()
+    return
+
+    #
     #  Solve for orientation and gyro bias
     #
 
@@ -117,12 +128,9 @@ def run_position_estimation():
         observed_features)
 
     estimated_positions = np.array([zero_offset_bezier(estimated_pos_controls, t) for t in true_frame_timestamps])
-    re_estimated_gravity = normalized(estimated_gravity) * true_gravity_magnitude
 
-    estimated_accel_readings = np.array([predict_accel(estimated_pos_controls, true_rot_controls, estimated_accel_bias, estimated_gravity, t)
-                                         for t in true_accel_timestamps])
-
-    estimated_pfeatures = np.array([[pr(predict_feature(estimated_pos_controls, true_rot_controls, x, t)) for x in true_landmarks]
+    estimated_pfeatures = np.array([[pr(predict_feature(estimated_pos_controls, true_rot_controls, x, t))
+                                     for x in true_landmarks]
                                     for t in true_frame_timestamps])
     true_pfeatures = pr(true_features)
     observed_pfeatures = pr(observed_features)
@@ -143,7 +151,6 @@ def run_position_estimation():
     print '  True gravity:', true_gravity
     print '  Estimated gravity:', estimated_gravity
     print '  Estimated gravity magnitude:', np.linalg.norm(estimated_gravity)
-    print '  Re-normalized gravity error: ', np.linalg.norm(re_estimated_gravity - true_gravity)
     for i in range(num_frames):
         print 'Frame %d position error: %f' % (i, np.linalg.norm(estimated_positions[i] - true_frame_positions[i]))
 
