@@ -6,12 +6,20 @@ import geometry
 
 
 class SocpConstraint(object):
-    def __init__(self, a, b, c, d):
+    def __init__(self, a=None, b=None, c=None, d=None):
+        if a is None:
+            a = np.zeros(len(b), len(c))
+        if b is None:
+            b = np.zeros(len(a))
+        if c is None:
+            c = np.zeros(len(a[0]))
+        if d is None:
+            d = 0.
         assert np.ndim(a) == 2
         assert np.ndim(b) == 1
         assert np.ndim(c) == 1
         assert np.isscalar(d)
-        assert np.shape(a) == (len(b), len(c)), 'shape was %s vs %d x %d' % (np.shape(a), len(b), len(c))
+        assert np.shape(a) == (len(b), len(c))
         self.a = np.asarray(a)
         self.b = np.asarray(b)
         self.c = np.asarray(c)
@@ -29,14 +37,23 @@ class SocpConstraint(object):
         d = self.d + np.dot(self.c[mask], values)
         return SocpConstraint(a, b, c, d)
 
+    def lhs(self, x):
+        return np.linalg.norm(np.dot(self.a, x) + self.b)
+
+    def rhs(self, x):
+        return np.dot(self.c, x) + self.d
+
     def is_satisfied(self, x):
-        return np.linalg.norm(np.dot(self.a, x) + self.b) <= np.dot(self.c, x) + self.d
+        return self.lhs(x) <= self.rhs(x)
 
 
 class SocpProblem(object):
     def __init__(self, objective, constraints):
         self.objective = np.asarray(objective)
         self.constraints = constraints
+
+    def add_constraint(self, *args, **kwargs):
+        self.constraints.append(SocpConstraint(*args, **kwargs))
 
     def conditionalize(self, mask, values):
         mask = np.asarray(mask)
@@ -45,15 +62,23 @@ class SocpProblem(object):
     def evaluate(self, x):
         print 'Objective:', np.dot(self.objective, x)
         for i, constraint in enumerate(self.constraints):
-            print '  Constraint %d: %s' % (i, 'satisfied' if constraint.is_satisfied(x) else 'not satisfied')
+            label = 'satisfied' if constraint.is_satisfied(x) else 'not satisfied'
+            print '  Constraint %d: %s (lhs=%.3f, rhs=%.3f)' % \
+                  (i, label, constraint.lhs(x), constraint.rhs(x))
 
 
-def solve_socp(problem):
+def solve(problem, sparse=False):
     """Minimize w*x subject to ||Ax + b|| <= c*x + d."""
-    c = cx.matrix(problem.objective)
-    g = [cx.matrix(np.vstack((-x.c, -x.a))) for x in problem.constraints]
-    h = [cx.matrix(np.hstack((x.d, x.b))) for x in problem.constraints]
-    return cx.solvers.socp(c, Gq=g, hq=h)
+    gs = []
+    hs = []
+    for constraint in problem.constraints:
+        a = constraint.a
+        b = constraint.b
+        c = constraint.c
+        d = constraint.d
+        gs.append(cx.matrix(np.vstack((-c, -a))))
+        hs.append(cx.matrix(np.hstack((d, b))))
+    return cx.solvers.socp(cx.matrix(problem.objective), Gq=gs, hq=hs)
 
 
 def run_2d_circle_problem():
@@ -63,7 +88,7 @@ def run_2d_circle_problem():
     ]
     problem = SocpProblem([0., -1.], constraints)
     #problem = problem.conditionalize([True, False], [-1.])
-    sol = solve_socp(problem)
+    sol = solve(problem)
     print sol['x']
 
 
@@ -120,7 +145,7 @@ def run_sfm():
 
     structure_problem = problem.conditionalize(np.arange(num_vars) < 6, np.hstack(ps))
 
-    sol = solve_socp(structure_problem)
+    sol = solve(structure_problem)
     print sol['x']
     if sol['x'] is None:
         print 'Solution not found'
