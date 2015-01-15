@@ -106,7 +106,7 @@ def run_position_estimation():
     # Construct ground truth
     #
     num_frames = 6
-    num_landmarks = 50
+    num_landmarks = 10
     num_imu_readings = 100
     bezier_degree = 4
 
@@ -147,13 +147,13 @@ def run_position_estimation():
     #
     # Add sensor noise
     #
-    accel_timestamp_noise = 0.
-    accel_reading_noise = 0.
-    accel_orientation_noise = 0.
+    accel_timestamp_noise = 1e-5
+    accel_reading_noise = 1e-5
+    accel_orientation_noise = 1e-5
 
-    frame_timestamp_noise = 0
-    frame_orientation_noise = 0.
-    feature_noise = 0.
+    frame_timestamp_noise = 1e-5
+    frame_orientation_noise = 1e-5
+    feature_noise = 1e-5
 
     observed_accel_timestamps = utils.add_white_noise(true_accel_timestamps, accel_timestamp_noise)
     observed_accel_readings = utils.add_white_noise(true_accel_readings, accel_reading_noise)
@@ -175,21 +175,32 @@ def run_position_estimation():
         observed_frame_orientations,
         observed_features,
         gravity_magnitude=true_gravity_magnitude+.1,
-        accel_tolerance=1e-2,
-        feature_tolerance=1e-2)
+        accel_tolerance=1e-4,
+        feature_tolerance=1e-4)
 
-    problem.evaluate(true_vars)
+    #problem.evaluate(true_vars)
 
-    begin = time.clock()
-    result = socp.solve(problem)
-    duration = time.clock() - begin
+    result = socp.solve(problem, sparse=True)
 
-    print 'Solve took %.3fs' % duration
+    if result['x'] is None:
+        print 'Did not find a feasible solution'
+        return
 
     estimated_vars = np.squeeze(result['x'])
 
-    print 'estimated:', estimated_vars.shape
-    print 'true:', true_vars.shape
+    estimated_pos_controls = estimated_vars[:true_pos_controls.size].reshape((-1, 3))
+    estimated_accel_bias = estimated_vars[true_pos_controls.size:true_pos_controls.size+3]
+    estimated_gravity = estimated_vars[true_pos_controls.size+3:true_pos_controls.size+6]
+    estimated_landmarks = estimated_vars[true_pos_controls.size+6:].reshape((-1, 3))
+
+    estimated_frame_positions = np.array([bezier.zero_offset_bezier(estimated_pos_controls, t)
+                                          for t in true_frame_timestamps])
+
+    print 'Position norms:', np.linalg.norm(true_frame_positions, axis=1)
+    print 'Position errors:', np.linalg.norm(estimated_frame_positions - true_frame_positions, axis=1)
+
+    print 'Gravity error:', np.linalg.norm(estimated_gravity - true_gravity)
+    print 'Accel bias error:', np.linalg.norm(estimated_accel_bias - true_accel_bias)
 
     print 'Max error:', np.max(estimated_vars - true_vars)
     print '  at ', np.argmax(estimated_vars - true_vars)

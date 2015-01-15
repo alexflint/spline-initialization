@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import cvxopt as cx
 
@@ -76,9 +77,17 @@ def solve(problem, sparse=False):
         b = constraint.b
         c = constraint.c
         d = constraint.d
-        gs.append(cx.matrix(np.vstack((-c, -a))))
+        g = np.vstack((-c, -a))
         hs.append(cx.matrix(np.hstack((d, b))))
-    return cx.solvers.socp(cx.matrix(problem.objective), Gq=gs, hq=hs)
+        if sparse:
+            gs.append(cx.sparse(cx.matrix(g)))
+        else:
+            gs.append(cx.matrix(g))
+    begin = time.clock()
+    solution = cx.solvers.socp(cx.matrix(problem.objective), Gq=gs, hq=hs)
+    duration = time.clock() - begin
+    print 'SOCP duration: %.3f' % duration
+    return solution
 
 
 def run_2d_circle_problem():
