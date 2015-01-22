@@ -60,6 +60,12 @@ class SocpProblem(object):
         mask = np.asarray(mask)
         return SocpProblem(self.objective[~mask], [x.conditionalize(mask, values) for x in self.constraints])
 
+    def conditionalize_indices(self, var_indices, values):
+        assert len(var_indices) == len(values)
+        mask = np.zeros(len(self.objective), bool)
+        mask[np.array(var_indices)] = True
+        return self.conditionalize(mask, values)
+
     def evaluate(self, x):
         print 'Objective:', np.dot(self.objective, x)
         for i, constraint in enumerate(self.constraints):

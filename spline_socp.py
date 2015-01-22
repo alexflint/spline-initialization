@@ -8,32 +8,32 @@ import seaborn as sns
 
 import utils
 import cayley
-import bezier
+import spline
 import socp
 import geometry
 
 
-def predict_accel(pos_controls, orient_controls, accel_bias, gravity, t):
-    orientation = cayley.cayley(bezier.zero_offset_bezier(orient_controls, t))
-    global_accel = bezier.zero_offset_bezier_second_deriv(pos_controls, t)
+def predict_accel(pos_curve, orient_curve, accel_bias, gravity, t):
+    orientation = cayley.cayley(orient_curve.evaluate(t))
+    global_accel = pos_curve.evaluate_d2(t)
     return np.dot(orientation, global_accel + gravity) + accel_bias
 
 
-def predict_feature(pos_controls, orient_controls, landmark, t):
-    r = cayley.cayley(bezier.zero_offset_bezier(orient_controls, t))
-    p = bezier.zero_offset_bezier(pos_controls, t)
+def predict_feature(pos_curve, orient_curve, landmark, t):
+    r = cayley.cayley(orient_curve.evaluate(t))
+    p = pos_curve.evaluate(t)
     y = np.dot(r, landmark - p)
     assert y[2] > 0
     return geometry.pr(y)
 
 
-def predict_depth(pos_controls, orient_controls, landmark, t):
-    r = cayley.cayley(bezier.zero_offset_bezier(orient_controls, t))
-    p = bezier.zero_offset_bezier(pos_controls, t)
+def predict_depth(pos_curve, orient_curve, landmark, t):
+    r = cayley.cayley(orient_curve.evaluate(t))
+    p = pos_curve.evaluate(t)
     return np.linalg.norm(np.dot(r, landmark - p))
 
 
-def construct_problem(bezier_degree,
+def construct_problem(spline_template,
                       observed_accel_timestamps,
                       observed_accel_orientations,
                       observed_accel_readings,
@@ -46,9 +46,11 @@ def construct_problem(bezier_degree,
                       accel_tolerance=1e-3,
                       gravity_magnitude=9.8,
                       max_bias_magnitude=.1):
+    assert isinstance(spline_template, spline.SplineTemplate)
+
     # Compute offsets
     position_offset = 0
-    position_len = (bezier_degree-1)*3
+    position_len = spline_template.control_size
     accel_bias_offset = position_offset + position_len
     gravity_offset = accel_bias_offset + 3
     structure_offset = gravity_offset + 3
@@ -72,7 +74,7 @@ def construct_problem(bezier_degree,
 
     # Construct accel constraints
     for t, r, a in zip(observed_accel_timestamps, observed_accel_orientations, observed_accel_readings):
-        amat = bezier.zero_offset_bezier_second_deriv_mat(t, bezier_degree-1, 3)
+        amat = spline_template.multidim_coefficients_d2(t)
         j = np.zeros((3, num_vars))
         j[:, :position_len] = np.dot(r, amat)
         j[:, gravity_offset:gravity_offset+3] = r
@@ -85,7 +87,7 @@ def construct_problem(bezier_degree,
         for j, z in enumerate(zs):
             point_offset = structure_offset + j*3
 
-            pmat = bezier.zero_offset_bezier_mat(t, bezier_degree-1, 3)
+            pmat = spline_template.multidim_coefficients(t)
             k_rc_r = np.dot(camera_matrix, np.dot(imu_to_camera, r))
             ymat = np.zeros((3, num_vars))
             ymat[:, :position_len] = -np.dot(k_rc_r, pmat)
@@ -99,34 +101,39 @@ def construct_problem(bezier_degree,
     return problem
 
 
-def run_bezier_position_estimation():
+def run_spline_position_estimation():
     np.random.seed(0)
 
     #
     # Construct ground truth
     #
+    duration = 1.
     num_frames = 6
     num_landmarks = 10
     num_imu_readings = 100
-    bezier_degree = 4
+
+    degree = 3
+    num_controls = 6
+    num_knots = num_controls - degree + 1
+    
+    tpl = spline.SplineTemplate(np.linspace(0, duration, num_knots), degree, 3)
 
     print 'Num landmarks:', num_landmarks
     print 'Num frames:', num_frames
     print 'Num IMU readings:', num_imu_readings
-    print 'Bezier curve degree:', bezier_degree
+    print 'Spline curve degree:', degree
 
     # Both splines should start at 0,0,0
     true_frame_timestamps = np.linspace(0, .9, num_frames)
     true_accel_timestamps = np.linspace(0, 1, num_imu_readings)
 
-    true_rot_controls = np.random.randn(bezier_degree-1, 3) * .1
-    true_pos_controls = np.random.randn(bezier_degree-1, 3)
+    true_rot_curve = tpl.build_random(.1)
+    true_pos_curve = tpl.build_random(first_control=np.zeros(3))
 
-    true_landmarks = np.random.randn(num_landmarks, 3)*5 + [0., 0., 20.]
+    true_landmarks = np.random.randn(num_landmarks, 3)*5 + np.array([0., 0., 20.])
 
-    true_frame_orientations = np.array([cayley.cayley(bezier.zero_offset_bezier(true_rot_controls, t))
-                                        for t in true_frame_timestamps])
-    true_frame_positions = np.array([bezier.zero_offset_bezier(true_pos_controls, t) for t in true_frame_timestamps])
+    true_frame_orientations = np.array(map(cayley.cayley, true_rot_curve.evaluate(true_frame_timestamps)))
+    true_frame_positions = np.array(true_pos_curve.evaluate(true_frame_timestamps))
 
     true_gravity_magnitude = 9.8
     true_gravity = utils.normalized(np.random.rand(3)) * true_gravity_magnitude
@@ -134,26 +141,28 @@ def run_bezier_position_estimation():
 
     print 'True gravity:', true_gravity
 
-    true_imu_orientations = np.array([cayley.cayley(bezier.zero_offset_bezier(true_rot_controls, t))
-                                      for t in true_accel_timestamps])
-    true_accel_readings = np.array([predict_accel(true_pos_controls, true_rot_controls, true_accel_bias, true_gravity, t)
+    true_imu_orientations = np.array(map(cayley.cayley, true_rot_curve.evaluate(true_accel_timestamps)))
+    true_accel_readings = np.array([predict_accel(true_pos_curve, true_rot_curve, true_accel_bias, true_gravity, t)
                                     for t in true_accel_timestamps])
 
-    true_features = np.array([[predict_feature(true_pos_controls, true_rot_controls, x, t) for x in true_landmarks]
+    true_features = np.array([[predict_feature(true_pos_curve, true_rot_curve, x, t) for x in true_landmarks]
                               for t in true_frame_timestamps])
 
-    true_vars = np.hstack((true_pos_controls.flatten(), true_accel_bias, true_gravity, true_landmarks.flatten()))
+    true_vars = np.hstack((true_pos_curve.controls.flatten(),
+                           true_accel_bias,
+                           true_gravity,
+                           true_landmarks.flatten()))
 
     #
     # Add sensor noise
     #
-    accel_timestamp_noise = 1e-5
-    accel_reading_noise = 1e-5
-    accel_orientation_noise = 1e-5
+    accel_timestamp_noise = 0
+    accel_reading_noise = 0
+    accel_orientation_noise = 0
 
-    frame_timestamp_noise = 1e-5
-    frame_orientation_noise = 1e-5
-    feature_noise = 1e-5
+    frame_timestamp_noise = 0
+    frame_orientation_noise = 0
+    feature_noise = 0
 
     observed_accel_timestamps = utils.add_white_noise(true_accel_timestamps, accel_timestamp_noise)
     observed_accel_readings = utils.add_white_noise(true_accel_readings, accel_reading_noise)
@@ -167,7 +176,7 @@ def run_bezier_position_estimation():
     # Solve
     #
     problem = construct_problem(
-        bezier_degree,
+        tpl,
         observed_accel_timestamps,
         observed_accel_orientations,
         observed_accel_readings,
@@ -178,7 +187,10 @@ def run_bezier_position_estimation():
         accel_tolerance=1e-3,
         feature_tolerance=1e-3)
 
-    #problem.evaluate(true_vars)
+    problem.evaluate(true_vars)
+    #return
+
+    problem = problem.conditionalize_indices(range(3), np.zeros(3))
 
     result = socp.solve(problem, sparse=True)
 
@@ -186,15 +198,16 @@ def run_bezier_position_estimation():
         print 'Did not find a feasible solution'
         return
 
-    estimated_vars = np.squeeze(result['x'])
+    estimated_vars = np.hstack((np.zeros(3), np.squeeze(result['x'])))
 
-    estimated_pos_controls = estimated_vars[:true_pos_controls.size].reshape((-1, 3))
-    estimated_accel_bias = estimated_vars[true_pos_controls.size:true_pos_controls.size+3]
-    estimated_gravity = estimated_vars[true_pos_controls.size+3:true_pos_controls.size+6]
-    estimated_landmarks = estimated_vars[true_pos_controls.size+6:].reshape((-1, 3))
+    spline_vars = tpl.control_size
+    estimated_pos_controls = estimated_vars[:spline_vars].reshape((-1, 3))
+    estimated_accel_bias = estimated_vars[spline_vars:spline_vars+3]
+    estimated_gravity = estimated_vars[spline_vars+3:spline_vars+6]
+    estimated_landmarks = estimated_vars[spline_vars+6:].reshape((-1, 3))
 
-    estimated_frame_positions = np.array([bezier.zero_offset_bezier(estimated_pos_controls, t)
-                                          for t in true_frame_timestamps])
+    estimated_pos_curve = spline.Spline(tpl, estimated_pos_controls)
+    estimated_frame_positions = estimated_pos_curve.evaluate(true_frame_timestamps)
 
     print 'Position norms:', np.linalg.norm(true_frame_positions, axis=1)
     print 'Position errors:', np.linalg.norm(estimated_frame_positions - true_frame_positions, axis=1)
@@ -212,4 +225,4 @@ def run_bezier_position_estimation():
 
 if __name__ == '__main__':
     np.set_printoptions(linewidth=1000)
-    run_bezier_position_estimation()
+    run_spline_position_estimation()

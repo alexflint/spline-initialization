@@ -138,6 +138,20 @@ class SplineTemplate(object):
     def num_bases(self):
         return num_bases(len(self.knots), self.degree)
 
+    @property
+    def control_shape(self):
+        return (self.num_bases,) if self.dims == 1 else (self.num_bases, self.dims)
+
+    @property
+    def control_size(self):
+        return self.num_bases * self.dims
+
+    def build_random(self, scale=1., offset=0., first_control=None):
+        controls = np.random.randn(*self.control_shape)*scale + offset
+        if first_control is not None:
+            controls[0] = first_control
+        return Spline(self, controls)
+
     def coefficients(self, ts):
         return coefficients(ts, self.knots, self.degree)
 
@@ -174,8 +188,7 @@ class Spline(object):
         if template.dims == 1:
             assert len(controls) == template.num_bases
         else:
-            assert controls.shape == (template.num_bases, template.dims), \
-                '%s vs %s' % (controls.shape, (template.num_bases, template.dims))
+            assert controls.shape == template.control_shape, '%s vs %s' % (controls.shape, template.control_shape)
         self.template = template
         self.controls = controls
 
