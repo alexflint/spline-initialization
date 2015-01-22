@@ -211,6 +211,29 @@ class Spline(object):
         return Spline(SplineTemplate(np.linspace(begin, duration, nk), degree, dims), controls)
 
 
+def fit(ts, ys, degree=3, num_knots=None, knot_frequency=5.):
+    ts = np.asarray(ts)
+    ys = np.asarray(ys)
+    t0 = ts[0]
+    duration = ts[-1] - t0
+    dims = 1 if np.ndim(ys) == 1 else ys.shape[1]
+    if num_knots is None:
+        num_knots = int(np.ceil(duration * knot_frequency)) + 1
+
+    # Create the linear system
+    tpl = SplineTemplate(np.linspace(t0, t0+duration, num_knots), degree, dims)
+    a = np.vstack([tpl.multidim_coefficients(t) for t in ts])
+    b = ys.flatten()
+
+    # Solve the system
+    controls, _, _, _ = np.linalg.lstsq(a, b)
+
+    # Construct the spline
+    if dims > 1:
+        controls = controls.reshape((-1, dims))
+    return Spline(tpl, controls)
+
+
 def main():
     np.random.seed(2)
 
