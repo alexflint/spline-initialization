@@ -85,13 +85,13 @@ def coefficients(ts, knots, degree):
 def coefficients_d1(ts, knots, degree):
     """Compute the coefficients of all bases for a spline evaluated at T."""
     return np.array([basis_d1(ts, i, knots, degree)
-                     for i in range(num_bases(len(knots), degree))])
+                     for i in range(num_bases(len(knots), degree))]).T
 
 
 def coefficients_d2(ts, knots, degree):
     """Compute the coefficients of all bases for a spline evaluated at T."""
     return np.array([basis_d2(ts, i, knots, degree)
-                     for i in range(num_bases(len(knots), degree))])
+                     for i in range(num_bases(len(knots), degree))]).T
 
 
 def multidim_coefficients(t, knots, degree, dims):
@@ -179,6 +179,12 @@ class SplineTemplate(object):
     def evaluate_d2(self, ts, controls):
         return evaluate_d2(ts, self.knots, self.degree, controls)
 
+    @classmethod
+    def linspaced(cls, num_knots, dims, duration=1., degree=3, begin=0., end=None):
+        if end is None:
+            end = begin + duration
+        return SplineTemplate(np.linspace(begin, end, num_knots), degree, dims)
+
 
 class Spline(object):
     """Represents a B-spline curve."""
@@ -205,10 +211,12 @@ class Spline(object):
         return self.template.evaluate_d2(ts, self.controls)
 
     @classmethod
-    def canonical(cls, controls, duration=1., degree=3, begin=0.):
+    def canonical(cls, controls, duration=1., degree=3, begin=0., end=None):
+        """Construct a spline with uniformly spaced knots from the specified control points."""
+        num_knots = len(controls) - degree + 1
         dims = np.shape(controls)[1] if np.ndim(controls) > 1 else 1
-        nk = len(controls) - degree + 1
-        return Spline(SplineTemplate(np.linspace(begin, duration, nk), degree, dims), controls)
+        tpl = SplineTemplate.linspaced(num_knots, dims, degree=degree, duration=duration, begin=begin, end=end)
+        return Spline(tpl, controls)
 
 
 def fit(ts, ys, degree=3, num_knots=None, knot_frequency=5.):

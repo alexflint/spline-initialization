@@ -66,12 +66,22 @@ class SocpProblem(object):
         mask[np.array(var_indices)] = True
         return self.conditionalize(mask, values)
 
-    def evaluate(self, x):
+    def evaluate(self, x, verbose=False):
         print 'Objective:', np.dot(self.objective, x)
+        lhs = []
+        rhs = []
         for i, constraint in enumerate(self.constraints):
-            label = 'satisfied' if constraint.is_satisfied(x) else 'not satisfied'
-            print '  Constraint %d: %s (lhs=%.3f, rhs=%.3f)' % \
-                  (i, label, constraint.lhs(x), constraint.rhs(x))
+            lhs.append(constraint.lhs(x))
+            rhs.append(constraint.rhs(x))
+
+        sat = np.all(np.array(lhs) <= np.array(rhs))
+        if verbose or not sat:
+            for i, (lhs, rhs) in enumerate(zip(lhs, rhs)):
+                label = 'satisfied' if (lhs <= rhs) else 'not satisfied'
+                print '  Constraint %d: %s (lhs=%.3f, rhs=%.3f)' % (i, label, lhs, rhs)
+
+        if sat:
+            print '  All constraints satisfied'
 
 
 def solve(problem, sparse=False):
