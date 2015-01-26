@@ -1,9 +1,10 @@
 import collections
 import bisect
 import numpy as np
+import cvxopt as cx
+import cvxopt.modeling as cxm
 
 import matplotlib
-
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -18,6 +19,10 @@ import lie
 
 def predict_accel(pos_curve, orient_curve, accel_bias, gravity, t):
     orientation = cayley.cayley(orient_curve.evaluate(t))
+    return predict_accel_with_orientation(pos_curve, orientation, accel_bias, gravity, t)
+
+
+def predict_accel_with_orientation(pos_curve, orientation, accel_bias, gravity, t):
     global_accel = pos_curve.evaluate_d2(t)
     return np.dot(orientation, global_accel + gravity) + accel_bias
 
@@ -137,19 +142,35 @@ def calibrated(z, k):
     return utils.normalized(np.linalg.solve(k, utils.unpr(z)))
 
 
-def construct_problem(spline_template,
-                      observed_accel_timestamps,
-                      observed_accel_orientations,
-                      observed_accel_readings,
-                      observed_frame_timestamps,
-                      observed_frame_orientations,
-                      observed_features,
-                      imu_to_camera=np.eye(3),
-                      camera_matrix=np.eye(3),
-                      feature_tolerance=1e-2,
-                      accel_tolerance=1e-3,
-                      gravity_magnitude=9.8,
-                      max_bias_magnitude=.1):
+def soc_constraint_from_quadratic_constraint(a, b, c):
+    """Convert a quadratic constraint of the form
+
+        x' A' A x + b' x + c <= 0
+
+    to an equivalent SOCP constraint of the form
+
+        || Q x + r ||_2 <= s' x + t
+    """
+    q = np.vstack((b/2., a))
+    r = np.hstack((c/2. + .5, np.zeros(len(a))))
+    s = -b/2.
+    t = -c/2. + .5
+    return q, r, s, t
+
+
+def construct_problem_inf(spline_template,
+                          observed_accel_timestamps,
+                          observed_accel_orientations,
+                          observed_accel_readings,
+                          observed_frame_timestamps,
+                          observed_frame_orientations,
+                          observed_features,
+                          imu_to_camera=np.eye(3),
+                          camera_matrix=np.eye(3),
+                          feature_tolerance=1e-2,
+                          accel_tolerance=1e-3,
+                          gravity_magnitude=9.8,
+                          max_bias_magnitude=.1):
     # Sanity checks
     assert isinstance(spline_template, spline.SplineTemplate)
     assert len(observed_accel_orientations) == len(observed_accel_readings)
@@ -183,7 +204,6 @@ def construct_problem(spline_template,
     assert np.all(counts_by_track > 0),\
         'These tracks had zero features: ' + ','.join(map(str, np.flatnonzero(counts_by_track == 0)))
 
-
     # Track IDs should be exactly 0..n-1
     assert all(track_id < num_tracks for track_id in track_ids)
 
@@ -208,7 +228,6 @@ def construct_problem(spline_template,
     accel_coefficients = spline_template.coefficients_d2(observed_accel_timestamps)
     for r, a, c in zip(observed_accel_orientations, observed_accel_readings, accel_coefficients):
         amat = spline.diagify(c, 3)
-        #amat = spline_template.multidim_coefficients_d2(t)
         j = np.zeros((3, num_vars))
         j[:, :position_len] = np.dot(r, amat)
         j[:, gravity_offset:gravity_offset+3] = r
@@ -240,7 +259,141 @@ def construct_problem(spline_template,
     return problem
 
 
-def estimate_trajectory_socp(spline_template,
+def compute_accel_residuals(trajectory,
+                            timestamps,
+                            orientations,
+                            readings):
+    assert len(orientations) == len(readings)
+    assert len(timestamps) == len(readings)
+    assert np.ndim(timestamps) == 1
+
+    residuals = []
+    for t, r, a in zip(timestamps, orientations, readings):
+        prediction = predict_accel_with_orientation(trajectory.position_curve,
+                                                    r,
+                                                    trajectory.accel_bias,
+                                                    trajectory.gravity,
+                                                    t)
+        residuals.append(prediction - a)
+    return np.hstack(residuals)
+
+
+def construct_problem_mixed(spline_template,
+                            observed_accel_timestamps,
+                            observed_accel_orientations,
+                            observed_accel_readings,
+                            observed_frame_timestamps,
+                            observed_frame_orientations,
+                            observed_features,
+                            imu_to_camera=np.eye(3),
+                            camera_matrix=np.eye(3),
+                            feature_tolerance=1e-2,
+                            gravity_magnitude=9.8,
+                            max_bias_magnitude=.1):
+    # Sanity checks
+    assert isinstance(spline_template, spline.SplineTemplate)
+    assert len(observed_accel_orientations) == len(observed_accel_readings)
+    assert len(observed_accel_timestamps) == len(observed_accel_readings)
+    assert len(observed_frame_timestamps) == len(observed_frame_orientations)
+    assert all(0 <= f.frame_id < len(observed_frame_timestamps) for f in observed_features)
+    assert np.ndim(observed_accel_timestamps) == 1
+    assert np.ndim(observed_frame_timestamps) == 1
+
+    # Compute offsets
+    position_offset = 0
+    position_len = spline_template.control_size
+    gravity_offset = position_offset + position_len
+    accel_bias_offset = gravity_offset + 3
+    structure_offset = accel_bias_offset + 3
+    track_ids = set(f.track_id for f in observed_features)
+
+    num_aux_vars = 1  # one extra variable representing the objective
+    num_frames = len(observed_frame_timestamps)
+    num_tracks = max(track_ids) + 1
+    num_vars = structure_offset + num_tracks * 3 + num_aux_vars
+
+    # Make sure each track has at least one observation
+    counts_by_frame = np.zeros(num_frames, int)
+    counts_by_track = np.zeros(num_tracks, int)
+    for f in observed_features:
+        counts_by_frame[f.frame_id] += 1
+        counts_by_track[f.track_id] += 1
+
+    assert np.all(counts_by_frame > 0),\
+        'These frames had zero features: ' + ','.join(map(str, np.flatnonzero(counts_by_frame == 0)))
+    assert np.all(counts_by_track > 0),\
+        'These tracks had zero features: ' + ','.join(map(str, np.flatnonzero(counts_by_track == 0)))
+
+    # Track IDs should be exactly 0..n-1
+    assert all(track_id < num_tracks for track_id in track_ids)
+
+    # Initialize the problem
+    objective = utils.unit(num_vars-1, num_vars)   # the last variable is the objective we minimize
+    problem = socp.SocpProblem(objective)
+
+    # Construct accel constraints
+    print 'Constructing constraints for %d accel readings...' % len(observed_accel_readings)
+    accel_coefficients = spline_template.coefficients_d2(observed_accel_timestamps)
+    accel_j_blocks = []
+    accel_r_blocks = []
+    for r, a, c in zip(observed_accel_orientations, observed_accel_readings, accel_coefficients):
+        amat = spline.diagify(c, 3)
+        j = np.zeros((3, num_vars))
+        j[:, :position_len] = np.dot(r, amat)
+        j[:, gravity_offset:gravity_offset+3] = r
+        j[:, accel_bias_offset:accel_bias_offset+3] = np.eye(3)
+        accel_j_blocks.append(j)
+        accel_r_blocks.append(a)
+
+    # Form the least squares objective || J*x + r ||^2
+    accel_j = np.vstack(accel_j_blocks)
+    accel_r = np.hstack(accel_r_blocks)
+
+    # Form the quadratic objective: x' J' J x + b' x + c <= objective  ("objective" is the variable we minimize)
+    accel_c = np.dot(accel_r, accel_r)
+    accel_b = -2. * np.dot(accel_j.T, accel_r)
+    accel_b[-1] = -1.
+
+    # Convert to an SOCP objective
+    problem.add_constraint(*soc_constraint_from_quadratic_constraint(accel_j, accel_b, accel_c))
+
+    # Construct gravity constraints
+    a_gravity = np.zeros((3, num_vars))
+    a_gravity[:, gravity_offset:gravity_offset+3] = np.eye(3)
+    d_gravity = gravity_magnitude
+    problem.add_constraint(a=a_gravity, d=d_gravity)
+
+    # Construct accel bias constraints
+    a_bias = np.zeros((3, num_vars))
+    a_bias[:, accel_bias_offset:accel_bias_offset+3] = np.eye(3)
+    d_bias = max_bias_magnitude
+    problem.add_constraint(a=a_bias, d=d_bias)
+
+    # Construct vision constraints
+    print 'Constructing constraints for %d features...' % len(observed_features)
+    pos_coefficients = spline_template.coefficients(observed_frame_timestamps)
+    pos_multidim_coefs = [spline.diagify(x, 3) for x in pos_coefficients]
+    for feature in observed_features:
+        r = observed_frame_orientations[feature.frame_id]
+        pmat = pos_multidim_coefs[feature.frame_id]
+
+        point_offset = structure_offset + feature.track_id*3
+        assert point_offset + 3 <= num_vars, 'track id was %d, num vars was %d' % (feature.track_id, num_vars)
+
+        k_rc_r = np.dot(camera_matrix, np.dot(imu_to_camera, r))
+        ymat = np.zeros((3, num_vars))
+        ymat[:, :position_len] = -np.dot(k_rc_r, pmat)
+        ymat[:, point_offset:point_offset+3] = k_rc_r
+
+        a_feature = ymat[:2] - np.outer(feature.position, ymat[2])
+        c_feature = ymat[2] * feature_tolerance
+
+        problem.add_constraint(a=a_feature, c=c_feature)
+
+    return problem
+
+
+def estimate_trajectory_inf(spline_template,
                              observed_accel_timestamps,
                              observed_accel_orientations,
                              observed_accel_readings,
@@ -254,7 +407,7 @@ def estimate_trajectory_socp(spline_template,
                              gravity_magnitude=9.8,
                              max_bias_magnitude=.1,
                              ground_truth=None):
-    problem = construct_problem(
+    problem = construct_problem_inf(
         spline_template,
         observed_accel_timestamps,
         observed_accel_orientations,
@@ -269,15 +422,22 @@ def estimate_trajectory_socp(spline_template,
         gravity_magnitude=gravity_magnitude,
         max_bias_magnitude=max_bias_magnitude)
 
+    print 'Constructed a problem with %d variables and %d constraints' % \
+          (len(problem.objective), len(problem.constraints))
+
+    # Evaluate at ground truth if requested
     if ground_truth is not None:
         problem.evaluate(ground_truth.flatten())
 
+    # Eliminate global position
+    print 'Eliminating the first position...'
     problem = problem.conditionalize_indices(range(3), np.zeros(3))
+
+    # Solve
     result = socp.solve(problem, sparse=True)
 
     if result['x'] is None:
-        print 'Did not find a feasible solution'
-        return
+        return None
 
     estimated_vars = np.hstack((np.zeros(3), np.squeeze(result['x'])))
 
@@ -286,6 +446,69 @@ def estimate_trajectory_socp(spline_template,
     gravity = estimated_vars[spline_vars:spline_vars+3]
     accel_bias = estimated_vars[spline_vars+3:spline_vars+6]
     landmarks = estimated_vars[spline_vars+6:].reshape((-1, 3))
+
+    curve = spline.Spline(spline_template, pos_controls)
+    return PositionEstimate(curve, gravity, accel_bias, landmarks)
+
+
+def estimate_trajectory_mixed(spline_template,
+                              observed_accel_timestamps,
+                              observed_accel_orientations,
+                              observed_accel_readings,
+                              observed_frame_timestamps,
+                              observed_frame_orientations,
+                              observed_features,
+                              imu_to_camera=np.eye(3),
+                              camera_matrix=np.eye(3),
+                              feature_tolerance=1e-2,
+                              gravity_magnitude=9.8,
+                              max_bias_magnitude=.1,
+                              ground_truth=None):
+    problem = construct_problem_mixed(
+        spline_template,
+        observed_accel_timestamps,
+        observed_accel_orientations,
+        observed_accel_readings,
+        observed_frame_timestamps,
+        observed_frame_orientations,
+        observed_features,
+        imu_to_camera=imu_to_camera,
+        camera_matrix=camera_matrix,
+        feature_tolerance=feature_tolerance,
+        gravity_magnitude=gravity_magnitude,
+        max_bias_magnitude=max_bias_magnitude)
+
+    print 'Constructed a problem with %d variables and %d constraints' % \
+          (len(problem.objective), len(problem.constraints))
+
+    # Evaluate at ground truth if requested
+    if ground_truth is not None:
+        # In the mixed formulation, the last variable is the sum of squared accel residuals
+        gt_accel_residuals = compute_accel_residuals(ground_truth,
+                                                     observed_accel_timestamps,
+                                                     observed_accel_orientations,
+                                                     observed_accel_readings)
+        gt_cost = np.dot(gt_accel_residuals, gt_accel_residuals)
+        ground_truth_augmented = np.hstack((ground_truth.flatten(), gt_cost * (1. + 1e-8)))
+        problem.evaluate(ground_truth_augmented)
+
+    # Eliminate global position
+    print 'Eliminating the first position...'
+    problem = problem.conditionalize_indices(range(3), np.zeros(3))
+
+    # Solve
+    result = socp.solve(problem, sparse=True)
+
+    if result['x'] is None:
+        return None
+
+    estimated_vars = np.hstack((np.zeros(3), np.squeeze(result['x'])))
+
+    spline_vars = spline_template.control_size
+    pos_controls = estimated_vars[:spline_vars].reshape((-1, 3))
+    gravity = estimated_vars[spline_vars:spline_vars+3]
+    accel_bias = estimated_vars[spline_vars+3:spline_vars+6]
+    landmarks = estimated_vars[spline_vars+6:-1].reshape((-1, 3))
 
     curve = spline.Spline(spline_template, pos_controls)
     return PositionEstimate(curve, gravity, accel_bias, landmarks)
@@ -367,27 +590,27 @@ def estimate_trajectory_linear(spline_template,
 
 
 def run_in_simulation():
-    np.random.seed(0)
+    np.random.seed(1)
 
     #
     # Construct ground truth
     #
-    duration = 20.
-    num_frames = 100
-    num_landmarks = 500
+    duration = 5.
+    num_frames = 12
+    num_landmarks = 50
     num_imu_readings = 100
 
     degree = 3
-    num_controls = 50
+    num_controls = 8
     num_knots = num_controls - degree + 1
     
     accel_timestamp_noise = 0
-    accel_reading_noise = 1e-3
+    accel_reading_noise = 0
     accel_orientation_noise = 0
 
     frame_timestamp_noise = 0
     frame_orientation_noise = 0
-    feature_noise = 1.
+    feature_noise = 0
 
     spline_template = spline.SplineTemplate(np.linspace(0, duration, num_knots), degree, 3)
 
@@ -463,22 +686,35 @@ def run_in_simulation():
     #
     # Solve
     #
-    solver = 'linear'
-    if solver == 'socp':
-        trajectory = estimate_trajectory_socp(spline_template,
-                                              observed_accel_timestamps,
-                                              observed_accel_orientations,
-                                              observed_accel_readings,
-                                              observed_frame_timestamps,
-                                              observed_frame_orientations,
-                                              observed_features,
-                                              imu_to_camera=true_imu_to_camera,
-                                              camera_matrix=true_camera_matrix,
-                                              gravity_magnitude=true_gravity_magnitude+.1,
-                                              accel_tolerance=1e-3,
-                                              feature_tolerance=1.,
-                                              ground_truth=true_trajectory)
-    elif solver == 'linear':
+    estimator = 'mixed'
+    if estimator == 'infnorm':
+        trajectory = estimate_trajectory_inf(spline_template,
+                                             observed_accel_timestamps,
+                                             observed_accel_orientations,
+                                             observed_accel_readings,
+                                             observed_frame_timestamps,
+                                             observed_frame_orientations,
+                                             observed_features,
+                                             imu_to_camera=true_imu_to_camera,
+                                             camera_matrix=true_camera_matrix,
+                                             gravity_magnitude=true_gravity_magnitude+.1,
+                                             feature_tolerance=5.,
+                                             accel_tolerance=1e-1,
+                                             ground_truth=true_trajectory)
+    elif estimator == 'mixed':
+        trajectory = estimate_trajectory_mixed(spline_template,
+                                               observed_accel_timestamps,
+                                               observed_accel_orientations,
+                                               observed_accel_readings,
+                                               observed_frame_timestamps,
+                                               observed_frame_orientations,
+                                               observed_features,
+                                               imu_to_camera=true_imu_to_camera,
+                                               camera_matrix=true_camera_matrix,
+                                               gravity_magnitude=true_gravity_magnitude+.1,
+                                               feature_tolerance=5.,
+                                               ground_truth=true_trajectory)
+    elif estimator == 'linear':
         trajectory = estimate_trajectory_linear(spline_template,
                                                 observed_accel_timestamps,
                                                 observed_accel_orientations,
@@ -489,7 +725,11 @@ def run_in_simulation():
                                                 imu_to_camera=true_imu_to_camera,
                                                 camera_matrix=true_camera_matrix)
     else:
-        print 'Invalid solver:', solver
+        print 'Invalid solver:', estimator
+        return
+
+    if trajectory is None:
+        print 'Did not find a feasible solution'
         return
 
     #
@@ -525,7 +765,7 @@ def run_with_dataset():
     vfusion_path = '/tmp/out'
 
     gravity = np.array([0, 0, 9.82])
-    min_track_length = 6
+    min_track_length = 4
     num_knots = 200
 
     # Load vision model
@@ -551,7 +791,7 @@ def run_with_dataset():
     all_vfusion_timestamps = all_vfusion_states[:, 1]
 
     begin_timestamp = all_vfusion_timestamps[0] + 10.
-    end_timestamp = all_vfusion_timestamps[0] + 20.  #25.
+    end_timestamp = all_vfusion_timestamps[0] + 25.
 
     vfusion_states = select_by_timestamp(all_vfusion_states,
                                          all_vfusion_timestamps,
@@ -611,65 +851,54 @@ def run_with_dataset():
           (len(frame_timestamps), len(track_ids), len(features), len(accel_readings))
 
     spline_tpl = spline.SplineTemplate.linspaced(num_knots, dims=3, begin=begin_timestamp, end=end_timestamp)
-    problem = construct_problem(spline_tpl,
-                                accel_timestamps,
-                                accel_orientations,
-                                accel_readings,
-                                frame_timestamps,
-                                frame_orientations,
-                                features,
-                                camera_matrix=camera_matrix,
-                                imu_to_camera=imu_to_camera,
-                                feature_tolerance=10.,
-                                accel_tolerance=2.,
-                                max_bias_magnitude=1.,
-                                gravity_magnitude=np.linalg.norm(gravity) + .1)
-
-    print 'Constructed a problem with %d variables and %d constraints' % \
-          (len(problem.objective), len(problem.constraints))
-
-    # Eliminate global position
-    print 'Eliminating the first position...'
-    problem = problem.conditionalize_indices(range(3), np.zeros(3))
-
-    # Run solver
-    print 'Solving...'
-    result = socp.solve(problem, sparse=True)
-
-    if result['x'] is None:
-        print 'Did not find a feasible solution'
-        return
+    solver = 'linear'
+    if solver == 'socp':
+        estimated = estimate_trajectory_inf(spline_tpl,
+                                             accel_timestamps,
+                                             accel_orientations,
+                                             accel_readings,
+                                             frame_timestamps,
+                                             frame_orientations,
+                                             features,
+                                             camera_matrix=camera_matrix,
+                                             imu_to_camera=imu_to_camera,
+                                             feature_tolerance=10.,
+                                             accel_tolerance=2.,
+                                             max_bias_magnitude=1.,
+                                             gravity_magnitude=np.linalg.norm(gravity) + .1)
+    elif solver == 'linear':
+        estimated = estimate_trajectory_linear(spline_tpl,
+                                               accel_timestamps,
+                                               accel_orientations,
+                                               accel_readings,
+                                               frame_timestamps,
+                                               frame_orientations,
+                                               features,
+                                               camera_matrix=camera_matrix,
+                                               imu_to_camera=imu_to_camera,
+                                               accel_weight=100.)
     else:
-        print 'Found a solution'
+        print 'Invalid solver:', solver
+        return
 
-    # Unpack results
-    estimated_vars = np.hstack((np.zeros(3), np.squeeze(result['x'])))
-
-    spline_vars = spline_tpl.control_size
-    estimated_pos_controls = estimated_vars[:spline_vars].reshape((-1, 3))
-    estimated_accel_bias = estimated_vars[spline_vars:spline_vars+3]
-    estimated_gravity = estimated_vars[spline_vars+3:spline_vars+6]
-    estimated_landmarks = estimated_vars[spline_vars+6:].reshape((-1, 3))
-
-    estimated_pos_curve = spline.Spline(spline_tpl, estimated_pos_controls)
-    estimated_frame_positions = estimated_pos_curve.evaluate(frame_timestamps)
+    estimated_frame_positions = estimated.position_curve.evaluate(frame_timestamps)
     vfusion_frame_positions = vfusion_pos_curve.evaluate(frame_timestamps)
 
-    print 'Estimated gravity:', estimated_gravity
-    print 'Estimated accel bias:', estimated_accel_bias
+    print 'Estimated gravity:', estimated.gravity
+    print 'Estimated accel bias:', estimated.accel_bias
     print '  vfusion accel bias box: ', np.min(vfusion_accel_bias, axis=0), np.max(vfusion_accel_bias, axis=0)
     print 'Position errors:', np.linalg.norm(estimated_frame_positions - vfusion_frame_positions, axis=1)
 
     # Save results to file
     np.savetxt('/tmp/solution/estimated_frame_positions.txt', estimated_frame_positions)
-    np.savetxt('/tmp/solution/estimated_pos_controls.txt', estimated_pos_controls)
-    np.savetxt('/tmp/solution/estimated_accel_bias.txt', estimated_accel_bias)
-    np.savetxt('/tmp/solution/estimated_gravity.txt', estimated_gravity)
-    np.savetxt('/tmp/solution/estimated_landmarks.txt', estimated_landmarks)
+    np.savetxt('/tmp/solution/estimated_pos_controls.txt', estimated.position_curve.controls)
+    np.savetxt('/tmp/solution/estimated_accel_bias.txt', estimated.accel_bias)
+    np.savetxt('/tmp/solution/estimated_gravity.txt', estimated.gravity)
+    np.savetxt('/tmp/solution/estimated_landmarks.txt', estimated.landmarks)
     np.savetxt('/tmp/knots.txt', spline_tpl.knots)
 
     plot_timestamps = np.linspace(begin_timestamp, end_timestamp, 500)
-    estimated_ps = estimated_pos_curve.evaluate(plot_timestamps)
+    estimated_ps = estimated.position_curve.evaluate(plot_timestamps)
     vfusion_ps = vfusion_pos_curve.evaluate(plot_timestamps)
 
     # Plot the estimated trajectory
@@ -682,23 +911,23 @@ def run_with_dataset():
     # Plot the estimated trajectory at its own scale
     plt.clf()
     plt.plot(estimated_ps[:, 0], estimated_ps[:, 1], 'r-')
-    plt.plot(estimated_pos_controls[:, 0], estimated_pos_controls[:, 1], 'b-', alpha=.2)
+    plt.plot(estimated.position_curve.controls[:, 0], estimated.position_curve.controls[:, 1], 'b-', alpha=.2)
     plt.axis('equal')
     plt.savefig('out/lone_trajectory.pdf')
 
     # Plot the estimated vars
     plt.clf()
-    plt.barh(np.arange(len(estimated_vars)), estimated_vars, height=.75, color='r')
+    plt.barh(np.arange(estimated.size), estimated.flatten(), height=.75, color='r')
     plt.savefig('out/vars.pdf')
 
     # Synthesize accel readings and compare to measured values
     timestamps = np.linspace(begin_timestamp, end_timestamp, 100)
     predicted_accels = []
     for t in timestamps:
-        predicted_accels.append(predict_accel(estimated_pos_curve,
+        predicted_accels.append(predict_accel(estimated.position_curve,
                                               vfusion_orientation_curve,
-                                              estimated_accel_bias,
-                                              estimated_gravity,
+                                              estimated.accel_bias,
+                                              estimated.gravity,
                                               t))
 
     predicted_accels = np.array(predicted_accels)

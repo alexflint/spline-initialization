@@ -49,9 +49,9 @@ class SocpConstraint(object):
 
 
 class SocpProblem(object):
-    def __init__(self, objective, constraints):
+    def __init__(self, objective, constraints=None):
         self.objective = np.asarray(objective)
-        self.constraints = constraints
+        self.constraints = constraints or []
 
     def add_constraint(self, *args, **kwargs):
         self.constraints.append(SocpConstraint(*args, **kwargs))
@@ -68,20 +68,19 @@ class SocpProblem(object):
 
     def evaluate(self, x, verbose=False):
         print 'Objective:', np.dot(self.objective, x)
-        lhs = []
-        rhs = []
-        for i, constraint in enumerate(self.constraints):
-            lhs.append(constraint.lhs(x))
-            rhs.append(constraint.rhs(x))
+        lhs = np.array([constraint.lhs(x) for constraint in self.constraints])
+        rhs = np.array([constraint.rhs(x) for constraint in self.constraints])
+        num_violated = np.sum(lhs > rhs)
 
-        sat = np.all(np.array(lhs) <= np.array(rhs))
-        if verbose or not sat:
+        if verbose or num_violated > 0:
             for i, (lhs, rhs) in enumerate(zip(lhs, rhs)):
                 label = 'satisfied' if (lhs <= rhs) else 'not satisfied'
-                print '  Constraint %d: %s (lhs=%.3f, rhs=%.3f)' % (i, label, lhs, rhs)
+                print '  Constraint %d: %s (lhs=%.8f, rhs=%.8f)' % (i, label, lhs, rhs)
 
-        if sat:
+        if num_violated == 0:
             print '  All constraints satisfied'
+        else:
+            print '  Not satisfied (%d constraints violated)' % num_violated
 
 
 def solve(problem, sparse=False):
