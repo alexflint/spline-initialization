@@ -15,6 +15,8 @@ import spline
 import socp
 import geometry
 import lie
+import plotting
+import triangulation
 
 
 def predict_accel(pos_curve, orient_curve, accel_bias, gravity, t):
@@ -28,13 +30,21 @@ def predict_accel_with_orientation(pos_curve, orientation, accel_bias, gravity, 
 
 
 def predict_feature(pos_curve, orient_curve, landmark, t, imu_to_camera, camera_matrix):
-    r = cayley.cayley(orient_curve.evaluate(t))
     p = pos_curve.evaluate(t)
-    y = np.dot(camera_matrix, np.dot(imu_to_camera, np.dot(r, landmark - p)))
-    if y[2] > 0:
-        return geometry.pr(y)
-    else:
+    r = cayley.cayley(orient_curve.evaluate(t))
+    return predict_feature_with_pose(r, p, landmark, imu_to_camera, camera_matrix)
+
+
+def predict_feature_with_pose(r, p, x, imu_to_camera, camera_matrix, allow_behind=True):
+    assert np.shape(r) == (3, 3), 'shape was '+str(np.shape(r))
+    assert np.shape(p) == (3,), 'shape was '+str(np.shape(p))
+    assert np.shape(x) == (3,), 'shape was '+str(np.shape(x))
+    assert np.shape(imu_to_camera) == (3, 3), 'shape was '+str(np.shape(imu_to_camera))
+    assert np.shape(camera_matrix) == (3, 3), 'shape was '+str(np.shape(camera_matrix))
+    y = np.dot(camera_matrix, np.dot(imu_to_camera, np.dot(r, x - p)))
+    if not allow_behind and y[2] <= 0:
         return None
+    return geometry.pr(y)
 
 
 class FeatureObservation(object):
@@ -406,7 +416,8 @@ def estimate_trajectory_inf(spline_template,
                              accel_tolerance=1e-3,
                              gravity_magnitude=9.8,
                              max_bias_magnitude=.1,
-                             ground_truth=None):
+                             ground_truth=None,
+                             **kwargs):
     problem = construct_problem_inf(
         spline_template,
         observed_accel_timestamps,
@@ -431,10 +442,10 @@ def estimate_trajectory_inf(spline_template,
 
     # Eliminate global position
     print 'Eliminating the first position...'
-    problem = problem.conditionalize_indices(range(3), np.zeros(3))
+    problem = problem.conditionalize_indices(range(3))
 
     # Solve
-    result = socp.solve(problem, sparse=True)
+    result = socp.solve(problem, sparse=True, **kwargs)
 
     if result['x'] is None:
         return None
@@ -463,7 +474,8 @@ def estimate_trajectory_mixed(spline_template,
                               feature_tolerance=1e-2,
                               gravity_magnitude=9.8,
                               max_bias_magnitude=.1,
-                              ground_truth=None):
+                              ground_truth=None,
+                              **kwargs):
     problem = construct_problem_mixed(
         spline_template,
         observed_accel_timestamps,
@@ -497,7 +509,7 @@ def estimate_trajectory_mixed(spline_template,
     problem = problem.conditionalize_indices(range(3), np.zeros(3))
 
     # Solve
-    result = socp.solve(problem, sparse=True)
+    result = socp.solve(problem, sparse=True, **kwargs)
 
     if result['x'] is None:
         return None
@@ -765,8 +777,11 @@ def run_with_dataset():
     vfusion_path = '/tmp/out'
 
     gravity = np.array([0, 0, 9.82])
-    min_track_length = 4
-    num_knots = 200
+    min_track_length = 3
+    num_knots = 10
+    max_frames = 20
+    min_features_per_frame = 10
+    max_iters = 100
 
     # Load vision model
     vision_model = list(open(dataset_path + '/vision_model.txt'))
@@ -790,8 +805,8 @@ def run_with_dataset():
     all_vfusion_states = np.loadtxt(vfusion_path + '/states.txt')
     all_vfusion_timestamps = all_vfusion_states[:, 1]
 
-    begin_timestamp = all_vfusion_timestamps[0] + 10.
-    end_timestamp = all_vfusion_timestamps[0] + 25.
+    begin_timestamp = all_vfusion_timestamps[0] + 5.
+    end_timestamp = all_vfusion_timestamps[0] + 15.
 
     vfusion_states = select_by_timestamp(all_vfusion_states,
                                          all_vfusion_timestamps,
@@ -820,25 +835,48 @@ def run_with_dataset():
     # Set up frames
     begin_frame_index = bisect.bisect_left(all_frame_timestamps, begin_timestamp)
     end_frame_index = bisect.bisect_left(all_frame_timestamps, end_timestamp)
-    frame_timestamps = all_frame_timestamps[begin_frame_index:end_frame_index]
+    if end_frame_index - begin_frame_index <= max_frames:
+        selected_frame_ids = np.arange(begin_frame_index, end_frame_index, dtype=int)
+    else:
+        selected_frame_ids = np.linspace(begin_frame_index, end_frame_index, max_frames).round().astype(int)
+
+    print 'Selected frames:', selected_frame_ids
+
+    frame_timestamps = all_frame_timestamps[selected_frame_ids]
     frame_orientations = [interpolate_orientation(vfusion_timestamps, vfusion_orientations, t)
                           for t in frame_timestamps]
 
     # Set up features
     print 'Selecting frame indices %d...%d' % (begin_frame_index, end_frame_index)
-    features = []
-    track_lengths = collections.defaultdict(int)
+    tracks_by_id = collections.defaultdict(list)
     for f in all_features:
-        if begin_frame_index <= f.frame_id < end_frame_index:
-            features.append(f)
-            track_lengths[f.track_id] += 1
+        if f.frame_id in selected_frame_ids:
+            tracks_by_id[f.track_id].append(f)
 
     # Filter by track length
-    features = filter(lambda f: track_lengths[f.track_id] >= min_track_length, features)
+    tracks = filter(lambda t: len(t) >= min_track_length, tracks_by_id.viewvalues())
+    track_counts = {index: 0 for index in selected_frame_ids}
+    for track in tracks:
+        for f in track:
+            track_counts[f.frame_id] += 1
+
+    # Filter tracks by track length, max tracks, and min features per frame
+    features = []
+    num_tracks_added = 0
+    sorted_tracks = sorted(tracks, key=len)
+    for track in sorted_tracks:
+        if any(track_counts[f.frame_id] <= min_features_per_frame for f in track):
+            num_tracks_added += 1
+            features.extend(track)
+        else:
+            for f in track:
+                track_counts[f.frame_id] -= 1
+
     print '  selected %d of %d features' % (len(features), len(all_features))
+    print '  features per frame: ', ' '.join(map(str, track_counts.viewvalues()))
 
     # Renumber track IDs and frame_ids consecutively
-    frame_ids = sorted(set(f.frame_id for f in features))
+    frame_ids = sorted(selected_frame_ids)
     track_ids = sorted(set(f.track_id for f in features))
     frame_index_by_id = {frame_id: index for index, frame_id in enumerate(frame_ids)}
     track_index_by_id = {track_id: index for index, track_id in enumerate(track_ids)}
@@ -846,27 +884,79 @@ def run_with_dataset():
         f.track_id = track_index_by_id[f.track_id]
         f.frame_id = frame_index_by_id[f.frame_id]
 
+    # Synthesize features for each frame and compare to observations
+    if False:
+        features_by_frame = [[] for _ in frame_timestamps]
+        for feature in features:
+            features_by_frame[feature.frame_id].append(feature.position)
+
+        xmin, _, xmax = utils.minmedmax([f.position[0] for f in features])
+        ymin, _, ymax = utils.minmedmax([f.position[1] for f in features])
+        for i, zs in enumerate(features_by_frame):
+            print 'Plotting %d features for frame %d...' % (len(zs), i)
+            plt.clf()
+            if len(zs) > 0:
+                zs = np.asarray(zs)
+                plt.plot(zs[:, 0], zs[:, 1], '.g', alpha=.8)
+            plt.xlim(xmin, xmax)
+            plt.ylim(ymax, ymin)
+            plt.savefig('out/features_%03d.pdf' % i)
+
+    # Create vfusion estimate
+    tracks_by_id = collections.defaultdict(list)
+    for f in features:
+        tracks_by_id[f.track_id].append(f)
+    vfusion_landmarks = np.array([triangulation.triangulate_midpoint(tracks_by_id[i],
+                                                                     vfusion_orientations,
+                                                                     vfusion_positions,
+                                                                     imu_to_camera,
+                                                                     camera_matrix)
+                                  for i in range(len(tracks_by_id))])
+    print 'landmarks:'
+    print vfusion_landmarks
+    vfusion_estimate = PositionEstimate(vfusion_pos_curve, gravity, vfusion_accel_bias, vfusion_landmarks)
+
+    # Plot the reprojected landmarks
+    plot_features(features, frame_timestamps, frame_orientations, vfusion_estimate,
+                  imu_to_camera, camera_matrix, 'out/vfusion')
+    #return
+
     # Create the problem
     print 'Creating problem for %d frames, %d tracks, %d features, and %d accel readings...' % \
           (len(frame_timestamps), len(track_ids), len(features), len(accel_readings))
 
     spline_tpl = spline.SplineTemplate.linspaced(num_knots, dims=3, begin=begin_timestamp, end=end_timestamp)
-    solver = 'linear'
-    if solver == 'socp':
+    estimator = 'mixed'
+    if estimator == 'socp':
         estimated = estimate_trajectory_inf(spline_tpl,
-                                             accel_timestamps,
-                                             accel_orientations,
-                                             accel_readings,
-                                             frame_timestamps,
-                                             frame_orientations,
-                                             features,
-                                             camera_matrix=camera_matrix,
-                                             imu_to_camera=imu_to_camera,
-                                             feature_tolerance=10.,
-                                             accel_tolerance=2.,
-                                             max_bias_magnitude=1.,
-                                             gravity_magnitude=np.linalg.norm(gravity) + .1)
-    elif solver == 'linear':
+                                            accel_timestamps,
+                                            accel_orientations,
+                                            accel_readings,
+                                            frame_timestamps,
+                                            frame_orientations,
+                                            features,
+                                            camera_matrix=camera_matrix,
+                                            imu_to_camera=imu_to_camera,
+                                            feature_tolerance=10.,
+                                            accel_tolerance=2.,
+                                            max_bias_magnitude=1.,
+                                            gravity_magnitude=np.linalg.norm(gravity) + .1,
+                                            maxiters=max_iters)
+    elif estimator == 'mixed':
+        estimated = estimate_trajectory_mixed(spline_tpl,
+                                              accel_timestamps,
+                                              accel_orientations,
+                                              accel_readings,
+                                              frame_timestamps,
+                                              frame_orientations,
+                                              features,
+                                              camera_matrix=camera_matrix,
+                                              imu_to_camera=imu_to_camera,
+                                              feature_tolerance=2.,
+                                              max_bias_magnitude=1.,
+                                              gravity_magnitude=np.linalg.norm(gravity) + .1,
+                                              maxiters=max_iters)
+    elif estimator == 'linear':
         estimated = estimate_trajectory_linear(spline_tpl,
                                                accel_timestamps,
                                                accel_orientations,
@@ -877,8 +967,24 @@ def run_with_dataset():
                                                camera_matrix=camera_matrix,
                                                imu_to_camera=imu_to_camera,
                                                accel_weight=100.)
+    elif estimator == 'lsqnonlin':
+        estimated = estimate_trajectory_lsqnonlin(spline_tpl,
+                                                  accel_timestamps,
+                                                  accel_orientations,
+                                                  accel_readings,
+                                                  frame_timestamps,
+                                                  frame_orientations,
+                                                  features,
+                                                  camera_matrix=camera_matrix,
+                                                  imu_to_camera=imu_to_camera,
+                                                  accel_weight=100.,
+                                                  seed=vfusion_estimate)
     else:
-        print 'Invalid solver:', solver
+        print 'Invalid solver:', estimator
+        return
+
+    if estimated is None:
+        print 'No solution found'
         return
 
     estimated_frame_positions = estimated.position_curve.evaluate(frame_timestamps)
@@ -895,7 +1001,7 @@ def run_with_dataset():
     np.savetxt('/tmp/solution/estimated_accel_bias.txt', estimated.accel_bias)
     np.savetxt('/tmp/solution/estimated_gravity.txt', estimated.gravity)
     np.savetxt('/tmp/solution/estimated_landmarks.txt', estimated.landmarks)
-    np.savetxt('/tmp/knots.txt', spline_tpl.knots)
+    np.savetxt('/tmp/solution/knots.txt', spline_tpl.knots)
 
     plot_timestamps = np.linspace(begin_timestamp, end_timestamp, 500)
     estimated_ps = estimated.position_curve.evaluate(plot_timestamps)
@@ -922,33 +1028,74 @@ def run_with_dataset():
 
     # Synthesize accel readings and compare to measured values
     timestamps = np.linspace(begin_timestamp, end_timestamp, 100)
-    predicted_accels = []
+    predicted_accel = []
     for t in timestamps:
-        predicted_accels.append(predict_accel(estimated.position_curve,
-                                              vfusion_orientation_curve,
-                                              estimated.accel_bias,
-                                              estimated.gravity,
-                                              t))
+        predicted_accel.append(predict_accel(estimated.position_curve,
+                                             vfusion_orientation_curve,
+                                             estimated.accel_bias,
+                                             estimated.gravity,
+                                             t))
 
-    predicted_accels = np.array(predicted_accels)
+    # Synthesize accel readings from gravity and accel bias only
+    predicted_stationary_accel = []
+    for t in timestamps:
+        r = cayley.cayley(vfusion_orientation_curve.evaluate(t))
+        predicted_stationary_accel.append(np.dot(r, estimated.gravity) + estimated.accel_bias)
+
+    predicted_accel = np.array(predicted_accel)
+    predicted_stationary_accel = np.array(predicted_stationary_accel)
 
     plt.clf()
-    plt.plot(timestamps, predicted_accels, '-', label='predicted')
+    plt.plot(timestamps, predicted_accel, '-', label='predicted')
     plt.plot(accel_timestamps, accel_readings, '-', label='observed')
     plt.legend()
     plt.savefig('out/accel.pdf')
 
-    return
-
-    # Plot
-    ts = np.linspace(begin_timestamp, end_timestamp, 200)
-    ys = vfusion_pos_curve.evaluate(ts)
-
     plt.clf()
-    plt.plot(vfusion_positions[:, 0], vfusion_positions[:, 1], 'gx', alpha=.5)
-    plt.plot(ys[:, 0], ys[:, 1], 'r-', alpha=.4)
-    plt.axis('equal')
-    plt.savefig('out/vfusion_positions.pdf')
+    plt.plot(timestamps, predicted_stationary_accel, '-', label='predicted')
+    plt.plot(accel_timestamps, accel_readings, '-', label='observed')
+    plt.legend()
+    plt.savefig('out/accel_stationary.pdf')
+
+    plot_features(features, frame_timestamps, frame_orientations, estimated,
+                  imu_to_camera, camera_matrix, 'out/estimated')
+
+
+def plot_features(features, frame_timestamps, frame_orientations, estimated, imu_to_camera, camera_matrix, output):
+    """Synthesize features for each frame and compare to observations."""
+    features_by_frame = [[] for _ in frame_timestamps]
+    predictions_by_frame = [[] for _ in frame_timestamps]
+    predicted_frame_positions = estimated.position_curve.evaluate(frame_timestamps)
+    num_behind = 0
+    for feature in features:
+        t = frame_timestamps[feature.frame_id]
+        r = frame_orientations[feature.frame_id]
+        p = predicted_frame_positions[feature.frame_id]
+        x = estimated.landmarks[feature.track_id]
+        z = predict_feature_with_pose(r, p, x, imu_to_camera, camera_matrix)
+        if z is None:
+            num_behind += 1
+        else:
+            predictions_by_frame[feature.frame_id].append(z)
+            features_by_frame[feature.frame_id].append(feature.position)
+
+    if num_behind > 0:
+        print '%d features (of %d) were behind the camera' % (num_behind, len(features))
+
+    xmin, _, xmax = utils.minmedmax([f.position[0] for f in features])
+    ymin, _, ymax = utils.minmedmax([f.position[1] for f in features])
+    for i, (zs, zzs) in enumerate(zip(predictions_by_frame, features_by_frame)):
+        print 'Plotting %d features for frame %d...' % (len(zs), i)
+        zs = np.asarray(zs)
+        zzs = np.asarray(zzs)
+        plt.clf()
+        if len(zs) > 0:
+            plotting.plot_segments(zip(zs, zzs), '.-k', alpha=.5)
+            plt.plot(zs[:, 0], zs[:, 1], '.r', alpha=.8)
+            plt.plot(zzs[:, 0], zzs[:, 1], '.g', alpha=.8)
+        plt.xlim(xmin, xmax)
+        plt.ylim(ymin, ymax)
+        plt.savefig(output + ('_%03d.pdf' % i))
 
 
 def run_fit_spline():
@@ -978,7 +1125,7 @@ def run_fit_spline_multidim():
 
 if __name__ == '__main__':
     np.set_printoptions(linewidth=1000)
-    run_in_simulation()
-    #run_with_dataset()
+    #run_in_simulation()
+    run_with_dataset()
     #run_fit_spline()
     #run_fit_spline_multidim()

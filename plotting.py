@@ -3,12 +3,13 @@ import matplotlib.pyplot as plt
 
 from geometry import arctans
 
+
 def plot_segments(segments, *args, **kwargs):
     xs = []
     ys = []
     for segment in segments:
-        xs += [ p[0] for p in segment ] + [None]
-        ys += [ p[1] for p in segment ] + [None]
+        xs += [p[0] for p in segment] + [None]
+        ys += [p[1] for p in segment] + [None]
     return plt.plot(xs, ys, *args, **kwargs)
 
 

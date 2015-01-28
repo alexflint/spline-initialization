@@ -19,12 +19,11 @@ class SocpConstraint(object):
         assert np.ndim(a) == 2
         assert np.ndim(b) == 1
         assert np.ndim(c) == 1
-        assert np.isscalar(d)
         assert np.shape(a) == (len(b), len(c))
         self.a = np.asarray(a)
         self.b = np.asarray(b)
         self.c = np.asarray(c)
-        self.d = np.asarray(d)
+        self.d = float(d)
 
     def conditionalize(self, mask, values):
         """Given a constraint over x1...xn, return a new constraint over a subset of the variables given fixed values
@@ -35,8 +34,14 @@ class SocpConstraint(object):
         a = self.a[:, ~mask]
         b = self.b + np.dot(self.a[:, mask], values)
         c = self.c[~mask]
-        d = self.d + np.dot(self.c[mask], values)
+        d = self.d + float(np.dot(self.c[mask], values))
         return SocpConstraint(a, b, c, d)
+
+    def conditionalize_at_zero(self, mask):
+        """Given a constraint over x1...xn, return a new constraint over a subset of the variables given fixed values
+        for the remaining variables."""
+        mask = np.asarray(mask)
+        return SocpConstraint(self.a[:, ~mask], self.b, self.c[~mask], self.d)
 
     def lhs(self, x):
         return np.linalg.norm(np.dot(self.a, x) + self.b)
@@ -56,12 +61,16 @@ class SocpProblem(object):
     def add_constraint(self, *args, **kwargs):
         self.constraints.append(SocpConstraint(*args, **kwargs))
 
-    def conditionalize(self, mask, values):
+    def conditionalize(self, mask, values=None):
         mask = np.asarray(mask)
-        return SocpProblem(self.objective[~mask], [x.conditionalize(mask, values) for x in self.constraints])
+        if values is None:
+            return SocpProblem(self.objective[~mask], [x.conditionalize_at_zero(mask) for x in self.constraints])
+        else:
+            return SocpProblem(self.objective[~mask], [x.conditionalize(mask, values) for x in self.constraints])
 
-    def conditionalize_indices(self, var_indices, values):
-        assert len(var_indices) == len(values)
+    def conditionalize_indices(self, var_indices, values=None):
+        if values is not None:
+            assert len(var_indices) == len(values)
         mask = np.zeros(len(self.objective), bool)
         mask[np.array(var_indices)] = True
         return self.conditionalize(mask, values)
@@ -83,7 +92,7 @@ class SocpProblem(object):
             print '  Not satisfied (%d constraints violated)' % num_violated
 
 
-def solve(problem, sparse=False):
+def solve(problem, sparse=False, **kwargs):
     """Minimize w*x subject to ||Ax + b|| <= c*x + d."""
     gs = []
     hs = []
@@ -99,9 +108,14 @@ def solve(problem, sparse=False):
         else:
             gs.append(cx.matrix(g))
     begin = time.clock()
-    solution = cx.solvers.socp(cx.matrix(problem.objective), Gq=gs, hq=hs)
+    cx.solvers.options.update(kwargs)
+    import mosek
+    cx.solvers.options['MOSEK'] = {mosek.iparam.log: 100, mosek.iparam.intpnt_max_iterations: 50000}
+    solution = cx.solvers.socp(cx.matrix(problem.objective), Gq=gs, hq=hs, solver='mosek')
     duration = time.clock() - begin
     print 'SOCP duration: %.3f' % duration
+    print 'Solver exited with status "%s"' % solution['status']
+    print 'Keys:', solution.keys()
     return solution
 
 
