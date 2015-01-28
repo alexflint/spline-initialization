@@ -5,6 +5,7 @@ import cvxopt as cx
 import cvxopt.modeling as cxm
 
 import matplotlib
+from matplotlib.backends.backend_pdf import PdfPages
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -778,10 +779,14 @@ def run_with_dataset():
 
     gravity = np.array([0, 0, 9.82])
     min_track_length = 3
-    num_knots = 10
     max_frames = 20
     min_features_per_frame = 10
     max_iters = 100
+
+    begin_time_offset = 5.
+    end_time_offset = 7.
+    knot_frequency = 5
+    num_knots = int(np.ceil((end_time_offset - begin_time_offset) * knot_frequency))
 
     # Load vision model
     vision_model = list(open(dataset_path + '/vision_model.txt'))
@@ -805,8 +810,8 @@ def run_with_dataset():
     all_vfusion_states = np.loadtxt(vfusion_path + '/states.txt')
     all_vfusion_timestamps = all_vfusion_states[:, 1]
 
-    begin_timestamp = all_vfusion_timestamps[0] + 5.
-    end_timestamp = all_vfusion_timestamps[0] + 15.
+    begin_timestamp = all_vfusion_timestamps[0] + begin_time_offset
+    end_timestamp = all_vfusion_timestamps[0] + end_time_offset
 
     vfusion_states = select_by_timestamp(all_vfusion_states,
                                          all_vfusion_timestamps,
@@ -884,24 +889,6 @@ def run_with_dataset():
         f.track_id = track_index_by_id[f.track_id]
         f.frame_id = frame_index_by_id[f.frame_id]
 
-    # Synthesize features for each frame and compare to observations
-    if False:
-        features_by_frame = [[] for _ in frame_timestamps]
-        for feature in features:
-            features_by_frame[feature.frame_id].append(feature.position)
-
-        xmin, _, xmax = utils.minmedmax([f.position[0] for f in features])
-        ymin, _, ymax = utils.minmedmax([f.position[1] for f in features])
-        for i, zs in enumerate(features_by_frame):
-            print 'Plotting %d features for frame %d...' % (len(zs), i)
-            plt.clf()
-            if len(zs) > 0:
-                zs = np.asarray(zs)
-                plt.plot(zs[:, 0], zs[:, 1], '.g', alpha=.8)
-            plt.xlim(xmin, xmax)
-            plt.ylim(ymax, ymin)
-            plt.savefig('out/features_%03d.pdf' % i)
-
     # Create vfusion estimate
     tracks_by_id = collections.defaultdict(list)
     for f in features:
@@ -916,10 +903,15 @@ def run_with_dataset():
     print vfusion_landmarks
     vfusion_estimate = PositionEstimate(vfusion_pos_curve, gravity, vfusion_accel_bias, vfusion_landmarks)
 
+    vfusion_reproj_errors = compute_reprojection_errors(features, frame_timestamps, frame_orientations,
+                                                        vfusion_estimate, imu_to_camera, camera_matrix)
+
+    features = [f for i, f in enumerate(features) if np.linalg.norm(vfusion_reproj_errors[i]) < 5.]
+    renumber_tracks(features, min_track_length=2)
+
     # Plot the reprojected landmarks
     plot_features(features, frame_timestamps, frame_orientations, vfusion_estimate,
-                  imu_to_camera, camera_matrix, 'out/vfusion')
-    #return
+                  imu_to_camera, camera_matrix, 'out/vfusion_features.pdf')
 
     # Create the problem
     print 'Creating problem for %d frames, %d tracks, %d features, and %d accel readings...' % \
@@ -1057,8 +1049,23 @@ def run_with_dataset():
     plt.legend()
     plt.savefig('out/accel_stationary.pdf')
 
+    # Plot features
     plot_features(features, frame_timestamps, frame_orientations, estimated,
-                  imu_to_camera, camera_matrix, 'out/estimated')
+                  imu_to_camera, camera_matrix, 'out/estimated_features.pdf')
+
+
+def compute_reprojection_errors(features, frame_timestamps, frame_orientations, estimated,
+                                imu_to_camera, camera_matrix):
+    errors = []
+    frame_positions = estimated.position_curve.evaluate(frame_timestamps)
+    for feature in features:
+        r = frame_orientations[feature.frame_id]
+        p = frame_positions[feature.frame_id]
+        x = estimated.landmarks[feature.track_id]
+        z = predict_feature_with_pose(r, p, x, imu_to_camera, camera_matrix)
+        errors.append(z - feature.position)
+    return np.array(errors)
+
 
 
 def plot_features(features, frame_timestamps, frame_orientations, estimated, imu_to_camera, camera_matrix, output):
@@ -1068,7 +1075,6 @@ def plot_features(features, frame_timestamps, frame_orientations, estimated, imu
     predicted_frame_positions = estimated.position_curve.evaluate(frame_timestamps)
     num_behind = 0
     for feature in features:
-        t = frame_timestamps[feature.frame_id]
         r = frame_orientations[feature.frame_id]
         p = predicted_frame_positions[feature.frame_id]
         x = estimated.landmarks[feature.track_id]
@@ -1084,6 +1090,8 @@ def plot_features(features, frame_timestamps, frame_orientations, estimated, imu
 
     xmin, _, xmax = utils.minmedmax([f.position[0] for f in features])
     ymin, _, ymax = utils.minmedmax([f.position[1] for f in features])
+
+    pdf = PdfPages(output)
     for i, (zs, zzs) in enumerate(zip(predictions_by_frame, features_by_frame)):
         print 'Plotting %d features for frame %d...' % (len(zs), i)
         zs = np.asarray(zs)
@@ -1095,7 +1103,8 @@ def plot_features(features, frame_timestamps, frame_orientations, estimated, imu
             plt.plot(zzs[:, 0], zzs[:, 1], '.g', alpha=.8)
         plt.xlim(xmin, xmax)
         plt.ylim(ymin, ymax)
-        plt.savefig(output + ('_%03d.pdf' % i))
+        pdf.savefig()
+    pdf.close()
 
 
 def run_fit_spline():
