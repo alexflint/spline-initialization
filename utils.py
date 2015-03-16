@@ -1,3 +1,5 @@
+import collections
+
 import numpy as np
 from lie import skew, SO3
 
@@ -85,3 +87,26 @@ def add_white_noise(x, sigma):
 def add_orientation_noise(x, sigma):
     x = np.atleast_3d(x)
     return np.array([np.dot(xi, SO3.exp(np.random.randn(3)*sigma)) for xi in x])
+
+
+def renumber_tracks(features, landmarks=None, min_track_length=None):
+    # Drop tracks that are too short
+    if min_track_length is not None:
+        track_lengths = collections.defaultdict(int)
+        for f in features:
+            track_lengths[f.track_id] += 1
+        features = filter(lambda f: track_lengths[f.track_id] >= min_track_length, features)
+
+    # Apply consistent renumbering
+    track_ids = sorted(set(f.track_id for f in features))
+    track_index_by_id = {track_id: index for index, track_id in enumerate(track_ids)}
+    for f in features:
+        f.track_id = track_index_by_id[f.track_id]
+
+    # Return the final features
+    if landmarks is not None:
+        assert len(track_ids) == 0 or len(landmarks) > max(track_ids)
+        landmarks = np.array([landmarks[i] for i in track_ids])
+        return features, landmarks
+    else:
+        return features

@@ -1,3 +1,3 @@
 figs:
-	python spline_socp.py
+	python run_simulations.py
 	python plot_errors_vs_trial.py
