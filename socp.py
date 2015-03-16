@@ -1,9 +1,13 @@
 import time
 import numpy as np
 import cvxopt as cx
+import mosek
 
 import lie
 import geometry
+
+
+timings = {}
 
 
 class SocpConstraint(object):
@@ -109,11 +113,12 @@ def solve(problem, sparse=False, **kwargs):
             gs.append(cx.matrix(g))
     begin = time.clock()
     cx.solvers.options.update(kwargs)
-    import mosek
     cx.solvers.options['MOSEK'] = {mosek.iparam.log: 100, mosek.iparam.intpnt_max_iterations: 50000}
     solution = cx.solvers.socp(cx.matrix(problem.objective), Gq=gs, hq=hs, solver='mosek')
     duration = time.clock() - begin
-    print 'SOCP duration: %.3f' % duration
+    timings['last_solve'] = solution['duration']
+    print 'SOCP duration: %.3f' % solution['duration']
+    print 'Total duration (including python wrappers): %.3f' % duration
     print 'Solver exited with status "%s"' % solution['status']
     return solution
 

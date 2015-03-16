@@ -53,6 +53,5 @@ def main():
     plt.savefig('figures/gravity_error_histogram.pdf')
 
 
-
 if __name__ == '__main__':
     main()

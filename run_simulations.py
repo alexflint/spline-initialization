@@ -2,6 +2,7 @@ import numpy as np
 
 import structures
 import simulation
+import socp
 import spline_socp
 import utils
 
@@ -92,5 +93,102 @@ def run_accuracy_trials():
     np.savetxt('results/trials.txt', trials)
 
 
+def run_timings_vs_num_landmarks():
+    np.random.seed(0)
+
+    duration = 5.
+    num_frames = 8
+    num_landmarks = 1000
+    num_imu_readings = 100
+    degree = 3
+    num_controls = 8
+    accel_timestamp_noise = 0
+    accel_reading_noise = 1e-3
+    accel_orientation_noise = 0
+    frame_timestamp_noise = 0
+    frame_orientation_noise = 0
+    feature_noise = 1.
+
+    calibration = structures.Calibration.random()
+
+    trials = []
+    true_trajectory, measurements, spline_template, true_frame_timestamps = simulation.simulate_trajectory(
+        calibration,
+        duration=duration,
+        num_frames=num_frames,
+        num_landmarks=num_landmarks,
+        num_imu_readings=num_imu_readings,
+        degree=degree,
+        num_controls=num_controls,
+        accel_timestamp_noise=accel_timestamp_noise,
+        accel_reading_noise=accel_reading_noise,
+        accel_orientation_noise=accel_orientation_noise,
+        frame_timestamp_noise=frame_timestamp_noise,
+        frame_orientation_noise=frame_orientation_noise,
+        feature_noise=feature_noise)
+    all_features = measurements.features
+    for n in np.linspace(10, 400, 25):
+        measurements.features = filter(lambda f: f.track_id < n, all_features)
+        try:
+            spline_socp.estimate_trajectory(calibration,
+                                            measurements,
+                                            spline_template,
+                                            estimator='mixed',
+                                            feature_tolerance=feature_noise*3)
+            trials.append((n, socp.timings['last_solve']))
+        except spline_socp.InsufficientObservationsError:
+            print 'Simulator failed to generate trajectory. Retrying...'
+
+    np.savetxt('results/timings_vs_num_landmarks.txt', trials)
+
+
+def run_timings_vs_num_knots():
+    np.random.seed(0)
+
+    duration = 5.
+    num_frames = 8
+    num_landmarks = 200
+    num_imu_readings = 100
+    degree = 3
+    num_controls = 8
+    accel_timestamp_noise = 0
+    accel_reading_noise = 1e-3
+    accel_orientation_noise = 0
+    frame_timestamp_noise = 0
+    frame_orientation_noise = 0
+    feature_noise = 1.
+
+    calibration = structures.Calibration.random()
+
+    trials = []
+    true_trajectory, measurements, spline_template, true_frame_timestamps = simulation.simulate_trajectory(
+        calibration,
+        duration=duration,
+        num_frames=num_frames,
+        num_landmarks=num_landmarks,
+        num_imu_readings=num_imu_readings,
+        degree=degree,
+        num_controls=num_controls,
+        accel_timestamp_noise=accel_timestamp_noise,
+        accel_reading_noise=accel_reading_noise,
+        accel_orientation_noise=accel_orientation_noise,
+        frame_timestamp_noise=frame_timestamp_noise,
+        frame_orientation_noise=frame_orientation_noise,
+        feature_noise=feature_noise)
+    for n in np.arange(2, 21):
+        spline_template.knots = np.linspace(0, duration, n)
+        try:
+            spline_socp.estimate_trajectory(calibration,
+                                            measurements,
+                                            spline_template,
+                                            estimator='mixed',
+                                            feature_tolerance=feature_noise*3)
+            trials.append((n, socp.timings['last_solve']))
+        except spline_socp.InsufficientObservationsError:
+            print 'Simulator failed to generate trajectory. Retrying...'
+
+    np.savetxt('results/timings_vs_num_knots.txt', trials)
+
+
 if __name__ == '__main__':
-    run_accuracy_trials()
+    run_timings_vs_num_knots()
