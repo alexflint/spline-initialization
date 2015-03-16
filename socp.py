@@ -115,7 +115,6 @@ def solve(problem, sparse=False, **kwargs):
     duration = time.clock() - begin
     print 'SOCP duration: %.3f' % duration
     print 'Solver exited with status "%s"' % solution['status']
-    print 'Keys:', solution.keys()
     return solution
 
 
@@ -125,7 +124,6 @@ def run_2d_circle_problem():
         SocpConstraint(np.eye(2), [2, 0], np.zeros(2), 3.)
     ]
     problem = SocpProblem([0., -1.], constraints)
-    #problem = problem.conditionalize([True, False], [-1.])
     sol = solve(problem)
     print sol['x']
 

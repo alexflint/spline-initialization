@@ -1,12 +1,10 @@
 import collections
 import bisect
 import numpy as np
-import cvxopt as cx
-import cvxopt.modeling as cxm
 
 import matplotlib
+matplotlib.use('Agg', warn=False)
 from matplotlib.backends.backend_pdf import PdfPages
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -106,7 +104,7 @@ def renumber_tracks(features, landmarks=None, min_track_length=None):
 
     # Return the final features
     if landmarks is not None:
-        assert len(landmarks) > max(track_ids)
+        assert len(track_ids) == 0 or len(landmarks) > max(track_ids)
         landmarks = np.array([landmarks[i] for i in track_ids])
         return features, landmarks
     else:
@@ -289,6 +287,62 @@ def compute_accel_residuals(trajectory,
     return np.hstack(residuals)
 
 
+def compute_reprojection_errors(features, frame_timestamps, frame_orientations, estimated,
+                                imu_to_camera, camera_matrix):
+    errors = []
+    frame_positions = estimated.position_curve.evaluate(frame_timestamps)
+    for feature in features:
+        r = frame_orientations[feature.frame_id]
+        p = frame_positions[feature.frame_id]
+        x = estimated.landmarks[feature.track_id]
+        z = predict_feature_with_pose(r, p, x, imu_to_camera, camera_matrix)
+        errors.append(z - feature.position)
+    return np.array(errors)
+
+
+def plot_features(features, frame_timestamps, frame_orientations, estimated, imu_to_camera, camera_matrix, output):
+    """Synthesize features for each frame and compare to observations."""
+    features_by_frame = [[] for _ in frame_timestamps]
+    predictions_by_frame = [[] for _ in frame_timestamps]
+    predicted_frame_positions = estimated.position_curve.evaluate(frame_timestamps)
+    num_behind = 0
+    for feature in features:
+        r = frame_orientations[feature.frame_id]
+        p = predicted_frame_positions[feature.frame_id]
+        x = estimated.landmarks[feature.track_id]
+        z = predict_feature_with_pose(r, p, x, imu_to_camera, camera_matrix)
+        if z is None:
+            num_behind += 1
+        else:
+            predictions_by_frame[feature.frame_id].append(z)
+            features_by_frame[feature.frame_id].append(feature.position)
+
+    if num_behind > 0:
+        print '%d features (of %d) were behind the camera' % (num_behind, len(features))
+
+    xmin, _, xmax = utils.minmedmax([f.position[0] for f in features])
+    ymin, _, ymax = utils.minmedmax([f.position[1] for f in features])
+
+    pdf = PdfPages(output)
+    for i, (zs, zzs) in enumerate(zip(predictions_by_frame, features_by_frame)):
+        print 'Plotting %d features for frame %d...' % (len(zs), i)
+        zs = np.asarray(zs)
+        zzs = np.asarray(zzs)
+        plt.clf()
+        if len(zs) > 0:
+            plotting.plot_segments(zip(zs, zzs), '.-k', alpha=.5)
+            plt.plot(zs[:, 0], zs[:, 1], '.r', alpha=.8)
+            plt.plot(zzs[:, 0], zzs[:, 1], '.g', alpha=.8)
+        plt.xlim(xmin, xmax)
+        plt.ylim(ymin, ymax)
+        pdf.savefig()
+    pdf.close()
+
+
+class InsufficientObservationsError(Exception):
+    pass
+
+
 def construct_problem_mixed(spline_template,
                             observed_accel_timestamps,
                             observed_accel_orientations,
@@ -302,6 +356,7 @@ def construct_problem_mixed(spline_template,
                             gravity_magnitude=9.8,
                             max_bias_magnitude=.1):
     # Sanity checks
+    assert len(observed_features) > 0
     assert isinstance(spline_template, spline.SplineTemplate)
     assert len(observed_accel_orientations) == len(observed_accel_readings)
     assert len(observed_accel_timestamps) == len(observed_accel_readings)
@@ -330,10 +385,12 @@ def construct_problem_mixed(spline_template,
         counts_by_frame[f.frame_id] += 1
         counts_by_track[f.track_id] += 1
 
-    assert np.all(counts_by_frame > 0),\
-        'These frames had zero features: ' + ','.join(map(str, np.flatnonzero(counts_by_frame == 0)))
-    assert np.all(counts_by_track > 0),\
-        'These tracks had zero features: ' + ','.join(map(str, np.flatnonzero(counts_by_track == 0)))
+    if not np.all(counts_by_frame > 0):
+        raise InsufficientObservationsError(
+            'These frames had zero features: ' + ','.join(map(str, np.flatnonzero(counts_by_frame == 0))))
+    if not np.all(counts_by_track > 0):
+        raise InsufficientObservationsError(
+            'These tracks had zero features: ' + ','.join(map(str, np.flatnonzero(counts_by_track == 0))))
 
     # Track IDs should be exactly 0..n-1
     assert all(track_id < num_tracks for track_id in track_ids)
@@ -566,6 +623,82 @@ def estimate_trajectory_linear(spline_template,
     pos_coefficients = spline_template.coefficients(observed_frame_timestamps)
     pos_multidim_coefs = [spline.diagify(x, 3) for x in pos_coefficients]
     for feature in observed_features:
+        z = feature.position
+        r = observed_frame_orientations[feature.frame_id]
+        q = np.dot(camera_matrix, np.dot(imu_to_camera, r))
+        c = q[:2] - np.outer(z, q[2])
+        pmat = pos_multidim_coefs[feature.frame_id]
+
+        point_offset = structure_offset + feature.track_id*3
+        j = np.zeros((2, num_vars))
+        j[:, :spline_template.control_size] = -np.dot(c, pmat)
+        j[:, point_offset:point_offset+3] = c
+
+        j_blocks.append(j)
+        r_blocks.append(np.zeros(2))
+
+    # Assemble full linear system
+    j = np.vstack(j_blocks)
+    r = np.hstack(r_blocks)
+
+    # Eliminate global position
+    j = j[:, 3:]
+
+    # Solve
+    print 'Solving linear system of size %d x %d' % j.shape
+    solution, _, _, _ = np.linalg.lstsq(j, r)
+
+    # Replace global position
+    solution = np.hstack((np.zeros(3), solution))
+
+    # Extract individual variables from solution
+    position_controls = solution[:spline_template.control_size].reshape((-1, 3))
+    position_curve = spline.Spline(spline_template, position_controls)
+    gravity = solution[gravity_offset:gravity_offset+3]
+    accel_bias = solution[accel_bias_offset:accel_bias_offset+3]
+    landmarks = solution[structure_offset:].reshape((-1, 3))
+    return PositionEstimate(position_curve, gravity, accel_bias, landmarks)
+
+
+def estimate_trajectory_householder(spline_template,
+                                    observed_accel_timestamps,
+                                    observed_accel_orientations,
+                                    observed_accel_readings,
+                                    observed_frame_timestamps,
+                                    observed_frame_orientations,
+                                    observed_features,
+                                    imu_to_camera=np.eye(3),
+                                    camera_matrix=np.eye(3),
+                                    accel_weight=1.):
+    assert isinstance(spline_template, spline.SplineTemplate)
+
+    num_tracks = max(f.track_id for f in observed_features) + 1
+
+    accel_bias_offset = spline_template.control_size
+    gravity_offset = spline_template.control_size + 3
+    structure_offset = spline_template.control_size + 6
+    num_vars = structure_offset + num_tracks * 3
+
+    j_blocks = []
+    r_blocks = []
+
+    # Add terms for accel residuals
+    print 'Constructing linear systems for %d accel readings...' % len(observed_accel_readings)
+    accel_coefficients = spline_template.coefficients_d2(observed_accel_timestamps)
+    for r, a, c in zip(observed_accel_orientations, observed_accel_readings, accel_coefficients):
+        amat = spline.diagify(c, 3)
+        j = np.zeros((3, num_vars))
+        j[:, :spline_template.control_size] = np.dot(r, amat)
+        j[:, gravity_offset:gravity_offset+3] = r
+        j[:, accel_bias_offset:accel_bias_offset+3] = np.eye(3)
+        j_blocks.append(j * accel_weight)
+        r_blocks.append(a * accel_weight)
+
+    # Add terms for features
+    print 'Constructing linear systems for %d features...' % len(observed_features)
+    pos_coefficients = spline_template.coefficients(observed_frame_timestamps)
+    pos_multidim_coefs = [spline.diagify(x, 3) for x in pos_coefficients]
+    for feature in observed_features:
         z = calibrated(feature.position, camera_matrix)
         h = householder(z)
         r = observed_frame_orientations[feature.frame_id]
@@ -602,29 +735,54 @@ def estimate_trajectory_linear(spline_template,
     return PositionEstimate(position_curve, gravity, accel_bias, landmarks)
 
 
-def run_in_simulation():
-    np.random.seed(1)
+class Measurements(object):
+    def __init__(self,
+                 accel_timestamps,
+                 accel_orientations,
+                 accel_readings,
+                 frame_timestamps,
+                 frame_orientations,
+                 features):
+        self.accel_timestamps = accel_timestamps
+        self.accel_orientations = accel_orientations
+        self.accel_readings = accel_readings
+        self.frame_timestamps = frame_timestamps
+        self.frame_orientations = frame_orientations
+        self.features = features
 
-    #
-    # Construct ground truth
-    #
-    duration = 5.
-    num_frames = 12
-    num_landmarks = 50
-    num_imu_readings = 100
 
-    degree = 3
-    num_controls = 8
+class Calibration(object):
+    def __init__(self,
+                 imu_to_camera,
+                 camera_matrix,
+                 gravity_magnitude):
+        self.imu_to_camera = imu_to_camera
+        self.camera_matrix = camera_matrix
+        self.gravity_magnitude = gravity_magnitude
+
+    @classmethod
+    def random(cls, image_width=320., image_height=240., gravity_magnitude=9.8):
+        imu_to_camera = lie.SO3.exp(np.random.randn(3))
+        camera_matrix = np.array([[image_width, 0., image_width/2.],
+                                  [0., image_height, image_height/2.],
+                                  [0., 0., 1.]])
+        return Calibration(imu_to_camera, camera_matrix, gravity_magnitude)
+
+
+def simulate_trajectory(calibration,
+                        duration=5.,
+                        num_frames=12,
+                        num_landmarks=50,
+                        num_imu_readings=100,
+                        degree=3,
+                        num_controls=8,
+                        accel_timestamp_noise=0.,
+                        accel_reading_noise=0.,
+                        accel_orientation_noise=0.,
+                        frame_timestamp_noise=0.,
+                        frame_orientation_noise=0.,
+                        feature_noise=0.):
     num_knots = num_controls - degree + 1
-    
-    accel_timestamp_noise = 0
-    accel_reading_noise = 0
-    accel_orientation_noise = 0
-
-    frame_timestamp_noise = 0
-    frame_orientation_noise = 0
-    feature_noise = 0
-
     spline_template = spline.SplineTemplate(np.linspace(0, duration, num_knots), degree, 3)
 
     print 'Num landmarks:', num_landmarks
@@ -639,19 +797,25 @@ def run_in_simulation():
     true_rot_curve = spline_template.build_random(.1)
     true_pos_curve = spline_template.build_random(first_control=np.zeros(3))
 
-    true_landmarks = np.random.randn(num_landmarks, 3)*5 + np.array([0., 0., 20.])
+    landmark_generator = 'normal'
+    if landmark_generator == 'normal':
+        true_landmarks = np.random.randn(num_landmarks, 3)*10
+    elif landmark_generator == 'near':
+        true_landmarks = []
+        for i in range(num_landmarks):
+            p = true_pos_curve.evaluate(true_frame_timestamps[i % len(true_frame_timestamps)])
+            true_landmarks.append(p + np.random.randn()*.1)
+    elif landmark_generator == 'far':
+        true_landmarks = []
+        for _ in range(num_landmarks):
+            true_landmarks.append(utils.normalized(np.random.randn(3)) * 100000.)
 
+    true_landmarks = np.asarray(true_landmarks)
     true_frame_orientations = np.array(map(cayley.cayley, true_rot_curve.evaluate(true_frame_timestamps)))
-    true_frame_positions = np.array(true_pos_curve.evaluate(true_frame_timestamps))
 
     true_gravity_magnitude = 9.8
     true_gravity = utils.normalized(np.random.rand(3)) * true_gravity_magnitude
     true_accel_bias = np.random.randn(3) * .01
-
-    true_imu_to_camera = lie.SO3.exp(np.random.randn(3))
-    true_camera_matrix = np.array([[150., 0., 75.],
-                                   [0., 100., 50.],
-                                   [0., 0., 1.]])
 
     # Sample IMU readings
     true_imu_orientations = np.array(map(cayley.cayley, true_rot_curve.evaluate(true_accel_timestamps)))
@@ -664,14 +828,12 @@ def run_in_simulation():
     for frame_id, t in enumerate(true_frame_timestamps):
         r = cayley.cayley(true_rot_curve.evaluate(t))
         p = true_pos_curve.evaluate(t)
-        a = np.dot(true_camera_matrix, np.dot(true_imu_to_camera, r))
+        a = np.dot(calibration.camera_matrix, np.dot(calibration.imu_to_camera, r))
         ys = np.dot(true_landmarks - p, a.T)
         for track_id, y in enumerate(ys):
-            # predict_feature will return None if the landmark is behind the camera
             if y[2] > 0:
                 true_features.append(FeatureObservation(frame_id, track_id, geometry.pr(y)))
             else:
-                print 'omitting feature for frame %d, track %d' % (frame_id, track_id)
                 num_behind += 1
 
     if num_behind > 0:
@@ -696,74 +858,96 @@ def run_in_simulation():
                                                     f.track_id,
                                                     utils.add_white_noise(f.position, feature_noise)))
 
-    #
-    # Solve
-    #
-    estimator = 'mixed'
-    if estimator == 'infnorm':
-        trajectory = estimate_trajectory_inf(spline_template,
-                                             observed_accel_timestamps,
-                                             observed_accel_orientations,
-                                             observed_accel_readings,
-                                             observed_frame_timestamps,
-                                             observed_frame_orientations,
-                                             observed_features,
-                                             imu_to_camera=true_imu_to_camera,
-                                             camera_matrix=true_camera_matrix,
-                                             gravity_magnitude=true_gravity_magnitude+.1,
-                                             feature_tolerance=5.,
-                                             accel_tolerance=1e-1,
-                                             ground_truth=true_trajectory)
+    if len(observed_features) < 5:
+        raise InsufficientObservationsError()
+
+    measurements = Measurements(observed_accel_timestamps,
+                                observed_accel_orientations,
+                                observed_accel_readings,
+                                observed_frame_timestamps,
+                                observed_frame_orientations,
+                                observed_features)
+
+    return true_trajectory, measurements, spline_template, true_frame_timestamps
+
+
+def estimate_trajectory(calibration,
+                        measurements,
+                        spline_template,
+                        estimator='mixed',
+                        feature_tolerance=5.,
+                        accel_tolerance=.1,
+                        ground_truth=None):
+    if estimator == 'socp':
+        return estimate_trajectory_inf(spline_template,
+                                       measurements.accel_timestamps,
+                                       measurements.accel_orientations,
+                                       measurements.accel_readings,
+                                       measurements.frame_timestamps,
+                                       measurements.frame_orientations,
+                                       measurements.features,
+                                       imu_to_camera=calibration.imu_to_camera,
+                                       camera_matrix=calibration.camera_matrix,
+                                       gravity_magnitude=calibration.gravity_magnitude+.1,
+                                       feature_tolerance=feature_tolerance,
+                                       accel_tolerance=accel_tolerance,
+                                       ground_truth=ground_truth)
     elif estimator == 'mixed':
-        trajectory = estimate_trajectory_mixed(spline_template,
-                                               observed_accel_timestamps,
-                                               observed_accel_orientations,
-                                               observed_accel_readings,
-                                               observed_frame_timestamps,
-                                               observed_frame_orientations,
-                                               observed_features,
-                                               imu_to_camera=true_imu_to_camera,
-                                               camera_matrix=true_camera_matrix,
-                                               gravity_magnitude=true_gravity_magnitude+.1,
-                                               feature_tolerance=5.,
-                                               ground_truth=true_trajectory)
+        return estimate_trajectory_mixed(spline_template,
+                                         measurements.accel_timestamps,
+                                         measurements.accel_orientations,
+                                         measurements.accel_readings,
+                                         measurements.frame_timestamps,
+                                         measurements.frame_orientations,
+                                         measurements.features,
+                                         imu_to_camera=calibration.imu_to_camera,
+                                         camera_matrix=calibration.camera_matrix,
+                                         gravity_magnitude=calibration.gravity_magnitude+.1,
+                                         feature_tolerance=feature_tolerance,
+                                         ground_truth=ground_truth)
+    elif estimator == 'householder':
+        return estimate_trajectory_householder(spline_template,
+                                               measurements.accel_timestamps,
+                                               measurements.accel_orientations,
+                                               measurements.accel_readings,
+                                               measurements.frame_timestamps,
+                                               measurements.frame_orientations,
+                                               measurements.features,
+                                               imu_to_camera=calibration.imu_to_camera,
+                                               camera_matrix=calibration.camera_matrix)
     elif estimator == 'linear':
-        trajectory = estimate_trajectory_linear(spline_template,
-                                                observed_accel_timestamps,
-                                                observed_accel_orientations,
-                                                observed_accel_readings,
-                                                observed_frame_timestamps,
-                                                observed_frame_orientations,
-                                                observed_features,
-                                                imu_to_camera=true_imu_to_camera,
-                                                camera_matrix=true_camera_matrix)
+        return estimate_trajectory_linear(spline_template,
+                                          measurements.accel_timestamps,
+                                          measurements.accel_orientations,
+                                          measurements.accel_readings,
+                                          measurements.frame_timestamps,
+                                          measurements.frame_orientations,
+                                          measurements.features,
+                                          imu_to_camera=calibration.imu_to_camera,
+                                          camera_matrix=calibration.camera_matrix)
     else:
         print 'Invalid solver:', estimator
         return
 
-    if trajectory is None:
-        print 'Did not find a feasible solution'
-        return
 
-    #
-    # Visualize
-    #
-    estimated_frame_positions = trajectory.position_curve.evaluate(true_frame_timestamps)
+def visualize_simulation_results(true_trajectory, estimated_trajectory, frame_timestamps):
+    true_frame_positions = true_trajectory.position_curve.evaluate(frame_timestamps)
+    estimated_frame_positions = estimated_trajectory.position_curve.evaluate(frame_timestamps)
 
     print 'Position errors:', np.linalg.norm(estimated_frame_positions - true_frame_positions, axis=1)
-    print 'Gravity error:', np.linalg.norm(trajectory.gravity - true_gravity)
-    print 'Accel bias error:', np.linalg.norm(trajectory.accel_bias - true_accel_bias)
-    print 'Max error:', np.max(trajectory.flatten() - true_trajectory.flatten())
+    print 'Gravity error:', np.linalg.norm(estimated_trajectory.gravity - true_trajectory.gravity)
+    print 'Accel bias error:', np.linalg.norm(estimated_trajectory.accel_bias - true_trajectory.accel_bias)
+    print 'Max error:', np.max(estimated_trajectory.flatten() - true_trajectory.flatten())
 
     # Plot the variables
     plt.clf()
     plt.barh(np.arange(true_trajectory.size), true_trajectory.flatten(), height=.3, alpha=.3, color='g')
-    plt.barh(np.arange(true_trajectory.size)+.4, trajectory.flatten(), height=.3, alpha=.3, color='r')
+    plt.barh(np.arange(estimated_trajectory.size)+.4, estimated_trajectory.flatten(), height=.3, alpha=.3, color='r')
     plt.savefig('out/vars.pdf')
 
-    plot_timestamps = np.linspace(0, duration, 500)
-    estimated_ps = trajectory.position_curve.evaluate(plot_timestamps)
-    true_ps = true_pos_curve.evaluate(plot_timestamps)
+    plot_timestamps = np.linspace(frame_timestamps[0], frame_timestamps[-1], 500)
+    true_ps = true_trajectory.position_curve.evaluate(plot_timestamps)
+    estimated_ps = estimated_trajectory.position_curve.evaluate(plot_timestamps)
 
     # Plot the estimated trajectory
     plt.clf()
@@ -773,19 +957,111 @@ def run_in_simulation():
     plt.savefig('out/trajectory.pdf')
 
 
+def mean_position_error(true_trajectory, estimated_trajectory, frame_timestamps):
+    actual = true_trajectory.position_curve.evaluate(frame_timestamps)
+    estimated = estimated_trajectory.position_curve.evaluate(frame_timestamps)
+    return np.mean(np.linalg.norm(estimated - actual, axis=1))
+
+
+def mean_velocity_error(true_trajectory, estimated_trajectory, frame_timestamps):
+    actual = true_trajectory.position_curve.evaluate_d1(frame_timestamps)
+    estimated = estimated_trajectory.position_curve.evaluate_d1(frame_timestamps)
+    return np.mean(np.linalg.norm(estimated - actual, axis=1))
+
+
+def gravity_direction_error(true_trajectory, estimated_trajectory):
+    actual = utils.normalized(true_trajectory.gravity)
+    estimated = utils.normalized(estimated_trajectory.gravity)
+    return np.arccos(np.dot(actual, estimated))
+
+
+def gravity_magnitude_error(true_trajectory, estimated_trajectory):
+    actual = np.linalg.norm(true_trajectory.gravity)
+    estimated = np.linalg.norm(estimated_trajectory.gravity)
+    return np.abs(actual - estimated)
+
+
+def accel_bias_error(true_trajectory, estimated_trajectory):
+    actual = true_trajectory.accel_bias
+    estimated = estimated_trajectory.accel_bias
+    return np.linalg.norm(actual - estimated)
+
+
+def run_simulation_series():
+    np.random.seed(0)
+
+    duration = 5.
+    num_frames = 8
+    num_landmarks = 50
+    num_imu_readings = 100
+    degree = 3
+    num_controls = 8
+    accel_timestamp_noise = 0
+    accel_reading_noise = 1e-3
+    accel_orientation_noise = 0
+    frame_timestamp_noise = 0
+    frame_orientation_noise = 0
+    feature_noise = 1.
+
+    num_trials = 1000
+
+    calibration = Calibration.random()
+
+    trials = []
+    while len(trials) < num_trials:
+        try:
+            true_trajectory, measurements, spline_template, true_frame_timestamps = simulate_trajectory(
+                calibration,
+                duration=duration,
+                num_frames=num_frames,
+                num_landmarks=num_landmarks,
+                num_imu_readings=num_imu_readings,
+                degree=degree,
+                num_controls=num_controls,
+                accel_timestamp_noise=accel_timestamp_noise,
+                accel_reading_noise=accel_reading_noise,
+                accel_orientation_noise=accel_orientation_noise,
+                frame_timestamp_noise=frame_timestamp_noise,
+                frame_orientation_noise=frame_orientation_noise,
+                feature_noise=feature_noise)
+            row = []
+            for estimator in ('socp', 'householder'):
+                estimated_trajectory = estimate_trajectory(calibration,
+                                                           measurements,
+                                                           spline_template,
+                                                           estimator=estimator,
+                                                           feature_tolerance=feature_noise*3)
+                pos_err = mean_position_error(true_trajectory, estimated_trajectory, true_frame_timestamps)
+                vel_err = mean_velocity_error(true_trajectory, estimated_trajectory, true_frame_timestamps)
+                bias_err = accel_bias_error(true_trajectory, estimated_trajectory)
+                g_err = gravity_direction_error(true_trajectory, estimated_trajectory)
+                row.extend((pos_err, vel_err, bias_err, g_err))
+            trials.append(row)
+        except InsufficientObservationsError:
+            print 'Simulator failed to generate a reasonable trajectory. Retrying...'
+
+    np.savetxt('results/trials.txt', trials)
+
+
+def run_in_simulation():
+    np.random.seed(1)
+    true_trajectory, estimated_trajectory, true_frame_timestamps = simulate_and_estimate_trajectory()
+    visualize_simulation_results(true_trajectory, estimated_trajectory, true_frame_timestamps)
+
+
 def run_with_dataset():
     dataset_path = '/tmp/dataset'
     vfusion_path = '/tmp/out'
 
     gravity = np.array([0, 0, 9.82])
     min_track_length = 3
-    max_frames = 20
+    max_frames = 100
     min_features_per_frame = 10
     max_iters = 100
 
     begin_time_offset = 5.
     end_time_offset = 7.
-    knot_frequency = 5
+    knot_frequency = 10
     num_knots = int(np.ceil((end_time_offset - begin_time_offset) * knot_frequency))
 
     # Load vision model
@@ -821,12 +1097,12 @@ def run_with_dataset():
     vfusion_timestamps = vfusion_states[:, 1]
     vfusion_orientations = vfusion_states[:, 2:11].reshape((-1, 3, 3))
     vfusion_positions = vfusion_states[:, -3:]
-    vfusion_pos_curve = spline.fit(vfusion_timestamps, vfusion_positions, knot_frequency=1)
-    vfusion_orientation_curve = FirstOrderRotationCurve(vfusion_timestamps, vfusion_orientations)
-
     vfusion_gyro_bias = vfusion_states[:, 11:14]
     vfusion_velocities = vfusion_states[:, 14:17]
     vfusion_accel_bias = vfusion_states[:, 17:20]
+
+    vfusion_orientation_curve = FirstOrderRotationCurve(vfusion_timestamps, vfusion_orientations)
+    vfusion_pos_curve = spline.fit(vfusion_timestamps, vfusion_positions, knot_frequency=1)
 
     print 'Max accel bias:', np.max(np.linalg.norm(vfusion_accel_bias, axis=1))
 
@@ -843,13 +1119,14 @@ def run_with_dataset():
     if end_frame_index - begin_frame_index <= max_frames:
         selected_frame_ids = np.arange(begin_frame_index, end_frame_index, dtype=int)
     else:
-        selected_frame_ids = np.linspace(begin_frame_index, end_frame_index, max_frames).round().astype(int)
+        selected_frame_ids = np.linspace(begin_frame_index, end_frame_index-1, max_frames).round().astype(int)
 
     print 'Selected frames:', selected_frame_ids
 
     frame_timestamps = all_frame_timestamps[selected_frame_ids]
     frame_orientations = [interpolate_orientation(vfusion_timestamps, vfusion_orientations, t)
                           for t in frame_timestamps]
+    frame_seed_positions = vfusion_pos_curve.evaluate(frame_timestamps)
 
     # Set up features
     print 'Selecting frame indices %d...%d' % (begin_frame_index, end_frame_index)
@@ -894,8 +1171,8 @@ def run_with_dataset():
     for f in features:
         tracks_by_id[f.track_id].append(f)
     vfusion_landmarks = np.array([triangulation.triangulate_midpoint(tracks_by_id[i],
-                                                                     vfusion_orientations,
-                                                                     vfusion_positions,
+                                                                     frame_orientations,
+                                                                     frame_seed_positions,
                                                                      imu_to_camera,
                                                                      camera_matrix)
                                   for i in range(len(tracks_by_id))])
@@ -906,8 +1183,8 @@ def run_with_dataset():
     vfusion_reproj_errors = compute_reprojection_errors(features, frame_timestamps, frame_orientations,
                                                         vfusion_estimate, imu_to_camera, camera_matrix)
 
-    features = [f for i, f in enumerate(features) if np.linalg.norm(vfusion_reproj_errors[i]) < 5.]
-    renumber_tracks(features, min_track_length=2)
+    features = [f for f, err in zip(features, vfusion_reproj_errors) if np.linalg.norm(err) < 5.]
+    features, vfusion_estimate.landmarks = renumber_tracks(features, vfusion_estimate.landmarks, min_track_length=2)
 
     # Plot the reprojected landmarks
     plot_features(features, frame_timestamps, frame_orientations, vfusion_estimate,
@@ -997,7 +1274,7 @@ def run_with_dataset():
 
     plot_timestamps = np.linspace(begin_timestamp, end_timestamp, 500)
     estimated_ps = estimated.position_curve.evaluate(plot_timestamps)
-    vfusion_ps = vfusion_pos_curve.evaluate(plot_timestamps)
+    vfusion_ps = vfusion_pos_curve.evaluate(plot_timestamps) - vfusion_pos_curve.evaluate(begin_timestamp)
 
     # Plot the estimated trajectory
     plt.clf()
@@ -1054,59 +1331,6 @@ def run_with_dataset():
                   imu_to_camera, camera_matrix, 'out/estimated_features.pdf')
 
 
-def compute_reprojection_errors(features, frame_timestamps, frame_orientations, estimated,
-                                imu_to_camera, camera_matrix):
-    errors = []
-    frame_positions = estimated.position_curve.evaluate(frame_timestamps)
-    for feature in features:
-        r = frame_orientations[feature.frame_id]
-        p = frame_positions[feature.frame_id]
-        x = estimated.landmarks[feature.track_id]
-        z = predict_feature_with_pose(r, p, x, imu_to_camera, camera_matrix)
-        errors.append(z - feature.position)
-    return np.array(errors)
-
-
-
-def plot_features(features, frame_timestamps, frame_orientations, estimated, imu_to_camera, camera_matrix, output):
-    """Synthesize features for each frame and compare to observations."""
-    features_by_frame = [[] for _ in frame_timestamps]
-    predictions_by_frame = [[] for _ in frame_timestamps]
-    predicted_frame_positions = estimated.position_curve.evaluate(frame_timestamps)
-    num_behind = 0
-    for feature in features:
-        r = frame_orientations[feature.frame_id]
-        p = predicted_frame_positions[feature.frame_id]
-        x = estimated.landmarks[feature.track_id]
-        z = predict_feature_with_pose(r, p, x, imu_to_camera, camera_matrix)
-        if z is None:
-            num_behind += 1
-        else:
-            predictions_by_frame[feature.frame_id].append(z)
-            features_by_frame[feature.frame_id].append(feature.position)
-
-    if num_behind > 0:
-        print '%d features (of %d) were behind the camera' % (num_behind, len(features))
-
-    xmin, _, xmax = utils.minmedmax([f.position[0] for f in features])
-    ymin, _, ymax = utils.minmedmax([f.position[1] for f in features])
-
-    pdf = PdfPages(output)
-    for i, (zs, zzs) in enumerate(zip(predictions_by_frame, features_by_frame)):
-        print 'Plotting %d features for frame %d...' % (len(zs), i)
-        zs = np.asarray(zs)
-        zzs = np.asarray(zzs)
-        plt.clf()
-        if len(zs) > 0:
-            plotting.plot_segments(zip(zs, zzs), '.-k', alpha=.5)
-            plt.plot(zs[:, 0], zs[:, 1], '.r', alpha=.8)
-            plt.plot(zzs[:, 0], zzs[:, 1], '.g', alpha=.8)
-        plt.xlim(xmin, xmax)
-        plt.ylim(ymin, ymax)
-        pdf.savefig()
-    pdf.close()
-
-
 def run_fit_spline():
     ts = np.linspace(0, 10, 10)
     ys = np.random.randn(len(ts))
@@ -1135,6 +1359,7 @@ def run_fit_spline_multidim():
 if __name__ == '__main__':
     np.set_printoptions(linewidth=1000)
     #run_in_simulation()
-    run_with_dataset()
+    run_simulation_series()
+    #run_with_dataset()
     #run_fit_spline()
     #run_fit_spline_multidim()
