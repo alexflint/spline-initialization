@@ -1,10 +1,27 @@
 import numpy as np
 
+import copy
 import structures
 import simulation
 import socp
 import spline_socp
 import utils
+
+
+simulator_options = dict(
+    duration=5.,
+    num_frames=8,
+    num_landmarks=50,
+    num_imu_readings=100,
+    degree=3,
+    num_controls=8,
+    accel_timestamp_noise=0,
+    accel_reading_noise=1e-3,
+    accel_orientation_noise=0,
+    frame_timestamp_noise=0,
+    frame_orientation_noise=0,
+    feature_noise=1.
+)
 
 
 def mean_position_error(true_trajectory, estimated_trajectory, frame_timestamps):
@@ -37,104 +54,104 @@ def accel_bias_error(true_trajectory, estimated_trajectory):
     return np.linalg.norm(actual - estimated)
 
 
-def run_accuracy_trials():
-    np.random.seed(0)
+def evaluate(calibration, measurements, spline_template, estimator, tol, true_trajectory):
+    estimated_trajectory = spline_socp.estimate_trajectory(
+        calibration,
+        measurements,
+        spline_template,
+        estimator=estimator,
+        feature_tolerance=tol)
+    pos_err = mean_position_error(true_trajectory, estimated_trajectory, measurements.frame_timestamps)
+    vel_err = mean_velocity_error(true_trajectory, estimated_trajectory, measurements.frame_timestamps)
+    bias_err = accel_bias_error(true_trajectory, estimated_trajectory)
+    g_err = gravity_direction_error(true_trajectory, estimated_trajectory)
+    return pos_err, vel_err, bias_err, g_err
 
-    duration = 5.
-    num_frames = 8
-    num_landmarks = 50
-    num_imu_readings = 100
-    degree = 3
-    num_controls = 8
-    accel_timestamp_noise = 0
-    accel_reading_noise = 1e-3
-    accel_orientation_noise = 0
-    frame_timestamp_noise = 0
-    frame_orientation_noise = 0
-    feature_noise = 1.
 
-    num_trials = 10
-
-    calibration = structures.Calibration.random()
-
+def simulate_and_evaluate(num_trials, calibration, estimators=None, **options):
+    if estimators is None:
+        estimators = ['mixed']
     trials = []
     while len(trials) < num_trials:
         try:
-            true_trajectory, measurements, spline_template, true_frame_timestamps = simulation.simulate_trajectory(
-                calibration,
-                duration=duration,
-                num_frames=num_frames,
-                num_landmarks=num_landmarks,
-                num_imu_readings=num_imu_readings,
-                degree=degree,
-                num_controls=num_controls,
-                accel_timestamp_noise=accel_timestamp_noise,
-                accel_reading_noise=accel_reading_noise,
-                accel_orientation_noise=accel_orientation_noise,
-                frame_timestamp_noise=frame_timestamp_noise,
-                frame_orientation_noise=frame_orientation_noise,
-                feature_noise=feature_noise)
+            true_trajectory, measurements, spline_template = simulation.simulate_trajectory(
+                calibration, **options)
             row = []
-            for estimator in ('socp', 'householder'):
-                estimated_trajectory = spline_socp.estimate_trajectory(calibration,
-                                                                       measurements,
-                                                                       spline_template,
-                                                                       estimator=estimator,
-                                                                       feature_tolerance=feature_noise*3)
-                pos_err = mean_position_error(true_trajectory, estimated_trajectory, true_frame_timestamps)
-                vel_err = mean_velocity_error(true_trajectory, estimated_trajectory, true_frame_timestamps)
-                bias_err = accel_bias_error(true_trajectory, estimated_trajectory)
-                g_err = gravity_direction_error(true_trajectory, estimated_trajectory)
-                row.extend((pos_err, vel_err, bias_err, g_err))
+            for estimator in estimators:
+                row.extend(evaluate(
+                    calibration,
+                    measurements,
+                    spline_template,
+                    estimator,
+                    simulator_options['feature_noise']*3,
+                    true_trajectory))
             trials.append(row)
         except spline_socp.InsufficientObservationsError:
             print 'Simulator failed to generate trajectory. Retrying...'
+    return np.asarray(trials)
 
-    np.savetxt('results/trials.txt', trials)
+
+def run_accuracy_comparison():
+    np.random.seed(0)
+    calibration = structures.Calibration.random()
+    trials = simulate_and_evaluate(1000, calibration, ['mixed', 'householder'], **simulator_options)
+    np.savetxt('results/accuracy_comparison.txt', trials)
+
+
+def run_accuracy_vs_feature_noise():
+    np.random.seed(1)
+    calibration = structures.Calibration.random()
+
+    options = simulator_options.copy()
+    options['feature_noise'] = 0.
+    options['accel_reading_noise'] = 1e-2
+
+    true_trajectory, measurements, spline_template = simulation.simulate_trajectory(calibration, **options)
+
+    results = []
+    for feature_noise in np.linspace(0, 10, 25):
+        print 'Trying feature noise = %f' % feature_noise
+        noisy_measurements = copy.deepcopy(measurements)
+        for f in noisy_measurements.features:
+            f.position += np.random.randn(2) * feature_noise
+
+        try:
+            pos_err, vel_err, bias_err, g_err = evaluate(
+                calibration,
+                noisy_measurements,
+                spline_template,
+                'mixed',
+                feature_noise*3+1e-3,
+                true_trajectory)
+
+            results.append((feature_noise, pos_err))
+        except spline_socp.FeasibilityError:
+            pass
+
+    np.savetxt('results/accuracy_vs_feature_noise.txt', results)
 
 
 def run_timings_vs_num_landmarks():
     np.random.seed(0)
 
-    duration = 5.
-    num_frames = 8
-    num_landmarks = 1000
-    num_imu_readings = 100
-    degree = 3
-    num_controls = 8
-    accel_timestamp_noise = 0
-    accel_reading_noise = 1e-3
-    accel_orientation_noise = 0
-    frame_timestamp_noise = 0
-    frame_orientation_noise = 0
-    feature_noise = 1.
+    options = simulator_options.copy()
+    options['num_landmarks'] = 1000
 
     calibration = structures.Calibration.random()
 
     trials = []
     true_trajectory, measurements, spline_template, true_frame_timestamps = simulation.simulate_trajectory(
-        calibration,
-        duration=duration,
-        num_frames=num_frames,
-        num_landmarks=num_landmarks,
-        num_imu_readings=num_imu_readings,
-        degree=degree,
-        num_controls=num_controls,
-        accel_timestamp_noise=accel_timestamp_noise,
-        accel_reading_noise=accel_reading_noise,
-        accel_orientation_noise=accel_orientation_noise,
-        frame_timestamp_noise=frame_timestamp_noise,
-        frame_orientation_noise=frame_orientation_noise,
-        feature_noise=feature_noise)
+        calibration, **options)
     all_features = measurements.features
     for n in np.linspace(10, 400, 25):
         measurements.features = filter(lambda f: f.track_id < n, all_features)
         try:
-            spline_socp.estimate_trajectory(calibration,
-                                            measurements,
-                                            spline_template,
-                                            estimator='mixed',
-                                            feature_tolerance=feature_noise*3)
+            spline_socp.estimate_trajectory(
+                calibration,
+                measurements,
+                spline_template,
+                estimator='mixed',
+                feature_tolerance=options['feature_noise']*3)
             trials.append((n, socp.timings['last_solve']))
         except spline_socp.InsufficientObservationsError:
             print 'Simulator failed to generate trajectory. Retrying...'
@@ -145,44 +162,20 @@ def run_timings_vs_num_landmarks():
 def run_timings_vs_num_knots():
     np.random.seed(0)
 
-    duration = 5.
-    num_frames = 8
-    num_landmarks = 200
-    num_imu_readings = 100
-    degree = 3
-    num_controls = 8
-    accel_timestamp_noise = 0
-    accel_reading_noise = 1e-3
-    accel_orientation_noise = 0
-    frame_timestamp_noise = 0
-    frame_orientation_noise = 0
-    feature_noise = 1.
-
     calibration = structures.Calibration.random()
 
     trials = []
     true_trajectory, measurements, spline_template, true_frame_timestamps = simulation.simulate_trajectory(
-        calibration,
-        duration=duration,
-        num_frames=num_frames,
-        num_landmarks=num_landmarks,
-        num_imu_readings=num_imu_readings,
-        degree=degree,
-        num_controls=num_controls,
-        accel_timestamp_noise=accel_timestamp_noise,
-        accel_reading_noise=accel_reading_noise,
-        accel_orientation_noise=accel_orientation_noise,
-        frame_timestamp_noise=frame_timestamp_noise,
-        frame_orientation_noise=frame_orientation_noise,
-        feature_noise=feature_noise)
+        calibration, **simulator_options)
     for n in np.arange(2, 21):
-        spline_template.knots = np.linspace(0, duration, n)
+        spline_template.knots = np.linspace(0, simulator_options['duration'], n)
         try:
-            spline_socp.estimate_trajectory(calibration,
-                                            measurements,
-                                            spline_template,
-                                            estimator='mixed',
-                                            feature_tolerance=feature_noise*3)
+            spline_socp.estimate_trajectory(
+                calibration,
+                measurements,
+                spline_template,
+                estimator='mixed',
+                feature_tolerance=simulator_options['feature_noise']*3)
             trials.append((n, socp.timings['last_solve']))
         except spline_socp.InsufficientObservationsError:
             print 'Simulator failed to generate trajectory. Retrying...'
@@ -191,4 +184,6 @@ def run_timings_vs_num_knots():
 
 
 if __name__ == '__main__':
-    run_timings_vs_num_knots()
+    run_accuracy_vs_feature_noise()
+    #run_accuracy_comparison()
+    #run_timings_vs_num_knots()

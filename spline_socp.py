@@ -14,6 +14,10 @@ class InsufficientObservationsError(Exception):
     pass
 
 
+class FeasibilityError(Exception):
+    pass
+
+
 def select_by_timestamp(data, timestamps, begin, end):
     begin_index = bisect.bisect_left(timestamps, begin)
     end_index = bisect.bisect_right(timestamps, end)
@@ -386,7 +390,7 @@ def estimate_trajectory_inf(spline_template,
     result = socp.solve(problem, sparse=True, **kwargs)
 
     if result['x'] is None:
-        return None
+        raise FeasibilityError('Solver returned status "%s"' % result['status'])
 
     estimated_vars = np.hstack((np.zeros(3), np.squeeze(result['x'])))
 
@@ -450,7 +454,7 @@ def estimate_trajectory_mixed(spline_template,
     result = socp.solve(problem, sparse=True, **kwargs)
 
     if result['x'] is None:
-        return None
+        raise FeasibilityError('Solver returned status "%s"' % result['status'])
 
     estimated_vars = np.hstack((np.zeros(3), np.squeeze(result['x'])))
 
@@ -623,6 +627,8 @@ def estimate_trajectory(calibration,
                         accel_tolerance=.1,
                         ground_truth=None):
     if estimator == 'socp':
+        raise ValueError("'socp' has been renamed to 'infnorm' to avoid confusion with 'mixed'")
+    elif estimator == 'infnorm':
         return estimate_trajectory_inf(spline_template,
                                        measurements.accel_timestamps,
                                        measurements.accel_orientations,
@@ -670,5 +676,4 @@ def estimate_trajectory(calibration,
                                           imu_to_camera=calibration.imu_to_camera,
                                           camera_matrix=calibration.camera_matrix)
     else:
-        print 'Invalid solver:', estimator
-        return
+        raise Exception('Invalid solver:'+str(estimator))

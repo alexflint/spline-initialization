@@ -105,4 +105,4 @@ def simulate_trajectory(calibration,
                                            observed_frame_orientations,
                                            observed_features)
 
-    return true_trajectory, measurements, spline_template, true_frame_timestamps
+    return true_trajectory, measurements, spline_template

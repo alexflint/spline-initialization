@@ -228,7 +228,7 @@ def run_with_dataset():
 
     spline_tpl = spline.SplineTemplate.linspaced(num_knots, dims=3, begin=begin_timestamp, end=end_timestamp)
     estimator = 'mixed'
-    if estimator == 'socp':
+    if estimator == 'infnorm':
         estimated = estimate_trajectory_inf(spline_tpl,
                                             accel_timestamps,
                                             accel_orientations,

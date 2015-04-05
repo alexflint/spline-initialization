@@ -7,8 +7,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-def main():
-    results = np.loadtxt('results/trials.txt').reshape((-1, 2, 4))
+def plot_accuracy_histograms():
+    results = np.loadtxt('results/accuracy_comparison.txt').reshape((-1, 2, 4))
 
     pos_errs_socp, pos_errs_linear = results[:, :, 0].T
     vel_errs_socp, vel_errs_linear = results[:, :, 1].T
@@ -53,5 +53,22 @@ def main():
     plt.savefig('figures/gravity_error_histogram.pdf')
 
 
+def plot_accuracy_vs_feature_noise():
+    results = np.loadtxt('results/accuracy_vs_feature_noise.txt')
+    feature_noise, socp_err = results.T
+
+    c1, c2 = sns.color_palette("Set1", 2)
+
+    plt.clf()
+    #plt.errorbar(feature_noise, socp_mean, socp_std, color=c1, label='SOCP')
+    #plt.errorbar(feature_noise, linear_mean, linear_std, color=c2, label='Linear')
+    plt.plot(feature_noise, socp_err)
+    plt.xlabel('Feature noise (image pixels)')
+    plt.ylabel('Position error (m)')
+    plt.ylim(ymin=0)
+    plt.savefig('figures/accuracy_vs_feature_noise.pdf')
+
+
 if __name__ == '__main__':
-    main()
+    #plot_accuracy_histograms()
+    plot_accuracy_vs_feature_noise()
