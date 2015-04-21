@@ -86,6 +86,8 @@ def simulate_and_evaluate(num_trials, calibration, estimators=None, **options):
                     simulator_options['feature_noise']*3,
                     true_trajectory))
             trials.append(row)
+        except spline_socp.FeasibilityError:
+            print 'Simulator failed to generate trajectory. Retrying...'
         except spline_socp.InsufficientObservationsError:
             print 'Simulator failed to generate trajectory. Retrying...'
     return np.asarray(trials)

@@ -116,8 +116,9 @@ def solve(problem, sparse=False, **kwargs):
     cx.solvers.options['MOSEK'] = {mosek.iparam.log: 100, mosek.iparam.intpnt_max_iterations: 50000}
     solution = cx.solvers.socp(cx.matrix(problem.objective), Gq=gs, hq=hs, solver='mosek')
     duration = time.clock() - begin
-    timings['last_solve'] = solution['duration']
-    print 'SOCP duration: %.3f' % solution['duration']
+    # duration = solution['duration']
+    timings['last_solve'] = duration
+    print 'SOCP duration: %.3f' % duration
     print 'Total duration (including python wrappers): %.3f' % duration
     print 'Solver exited with status "%s"' % solution['status']
     return solution
